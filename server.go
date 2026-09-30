@@ -13,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"mime/multipart"
@@ -23,6 +24,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -2156,10 +2158,37 @@ type rawClientSessions struct {
 	chunkStartTs int64 // unix millis начала текущего chunk'а — для downlinkMaxDwellMS
 }
 
+var (
+	rawFlowHash  bool
+	rawChunkSize int
+)
+
+func resolveRawFlowHash(val string) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "true", "1", "yes", "on", "eco":
+		return true
+	case "false", "0", "no", "off", "fast":
+		return false
+	case "auto", "":
+		return runtime.GOARCH == "mips" || runtime.GOARCH == "mipsle"
+	default:
+		return runtime.GOARCH == "mips" || runtime.GOARCH == "mipsle"
+	}
+}
+
+func resolveRawChunkSize(val int) int {
+	if val <= 0 {
+		return 8
+	}
+	return val
+}
+
 type rawRouter struct {
 	file            *os.File
 	mu              sync.RWMutex
 	sessions        map[string]*rawClientSessions // keyed by assigned raw IP клиента
+	flowHash        bool                          // true = 5-tuple flow hash (CPU eco для MIPS), false = chunked round-robin (fast для ARM/x86)
+	chunkSize       int                           // размер чанка пакетов при flowHash=false (по умолчанию 8)
 	uplinkErrLogged uint32                        // чтобы не заспамить лог при устойчивой ошибке записи
 	firstUplink     uint32
 	firstDownlink   uint32
@@ -2234,9 +2263,15 @@ func newRawRouter() (*rawRouter, error) {
 		return nil, err
 	}
 
-	r := &rawRouter{file: tunFile, sessions: make(map[string]*rawClientSessions)}
+	r := &rawRouter{
+		file:      tunFile,
+		sessions:  make(map[string]*rawClientSessions),
+		flowHash:  rawFlowHash,
+		chunkSize: resolveRawChunkSize(rawChunkSize),
+	}
 	go r.downlinkLoop()
-	log.Printf("[RAW] TUN %s поднят (%s), MTU %d", rawIfaceName, rawServerCIDR, rawMTU)
+	log.Printf("[RAW] TUN %s поднят (%s), MTU %d | flow-hash: %v (chunk=%d, arch=%s)",
+		rawIfaceName, rawServerCIDR, rawMTU, r.flowHash, r.chunkSize, runtime.GOARCH)
 	return r, nil
 }
 
@@ -2269,15 +2304,40 @@ func (r *rawRouter) downlinkLoop() {
 // пакета в его очередь, НЕ отпуская r.mu между выбором и отправкой. Раньше
 // это были два шага (pickDownlinkConn + enqueue) с отпущенным локом между
 // ними, и в это окно unregister успевал снять воркера и закрыть его sendCh —
-// отправка в закрытый канал роняла паникой весь сервер. Под общим локом
-// close уже не может опередить отправку: unregister закрывает канал только
-// после того, как снял воркера под r.mu, то есть после завершения любой
-// отправки, начатой до снятия.
-// Возвращает false, если сессии для dst нет.
+// ipv4FlowHash — canonical 5-tuple (symmetric with client dispatcher.go).
+func ipv4FlowHash(packet []byte) (uint32, bool) {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return 0, false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if ihl < 20 || len(packet) < ihl+4 {
+		return 0, false
+	}
+	proto := packet[9]
+	if proto != 6 && proto != 17 {
+		return 0, false
+	}
+	aIP := packet[12:16]
+	bIP := packet[16:20]
+	aPort := packet[ihl : ihl+2]
+	bPort := packet[ihl+2 : ihl+4]
+	if bytes.Compare(aIP, bIP) > 0 || (bytes.Equal(aIP, bIP) && bytes.Compare(aPort, bPort) > 0) {
+		aIP, bIP = bIP, aIP
+		aPort, bPort = bPort, aPort
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte{proto})
+	_, _ = h.Write(aIP)
+	_, _ = h.Write(aPort)
+	_, _ = h.Write(bIP)
+	_, _ = h.Write(bPort)
+	return h.Sum32(), true
+}
+
 func (r *rawRouter) dispatchDownlink(dst string, pkt []byte) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	w := r.pickDownlinkConnLocked(dst, len(pkt))
+	w := r.pickDownlinkConnLocked(dst, pkt)
 	if w == nil {
 		return false
 	}
@@ -2290,35 +2350,29 @@ func (r *rawRouter) dispatchDownlink(dst string, pkt []byte) bool {
 	return true
 }
 
-// pickDownlinkConnLocked выбирает воркера для очередного downlink-пакета
-// клиента dst, размазывая нагрузку по всем его зарегистрированным воркерам
-// адаптивными чанками (см. downlinkChunkSizeFor) с предохранителем
-// downlinkMaxDwellMS на случай, если текущий relay начал тормозить.
+// pickDownlinkConnLocked выбирает воркера для очередного downlink-пакета клиента dst.
+// При flowHash = true привязывает поток по 5-tuple hash (разгрузка CPU на MIPS).
+// При flowHash = false распределяет нагрузку чанками по chunkSize пакетов по всем воркерам (максимальная скорость на ARM/x86, поведение qWDTT).
 // Вызывается с уже взятым r.mu.
-func (r *rawRouter) pickDownlinkConnLocked(dst string, pktSize int) *downlinkWorker {
+func (r *rawRouter) pickDownlinkConnLocked(dst string, pkt []byte) *downlinkWorker {
 	cs := r.sessions[dst]
 	if cs == nil || len(cs.workers) == 0 {
 		return nil
 	}
-	if cs.rrIndex >= len(cs.workers) {
+	nw := len(cs.workers)
+	if r.flowHash {
+		if h, ok := ipv4FlowHash(pkt); ok {
+			return cs.workers[int(h%uint32(nw))]
+		}
+	}
+	if cs.rrIndex >= nw {
 		cs.rrIndex = 0
 	}
-
-	now := time.Now().UnixMilli()
-	if cs.chunkStartTs == 0 {
-		cs.chunkStartTs = now
-	} else if now-cs.chunkStartTs >= downlinkMaxDwellMS {
-		cs.rrIndex = (cs.rrIndex + 1) % len(cs.workers)
-		cs.rrCount = 0
-		cs.chunkStartTs = now
-	}
-
 	w := cs.workers[cs.rrIndex]
 	cs.rrCount++
-	if cs.rrCount >= downlinkChunkSizeFor(pktSize) {
-		cs.rrIndex = (cs.rrIndex + 1) % len(cs.workers)
+	if cs.rrCount >= r.chunkSize {
+		cs.rrIndex = (cs.rrIndex + 1) % nw
 		cs.rrCount = 0
-		cs.chunkStartTs = now
 	}
 	return w
 }
@@ -2731,7 +2785,11 @@ func main() {
 	flagNatIface := flag.String("nat-if", "", "egress interface for MASQUERADE")
 	flag.IntVar(&rawDownlinkRate, "raw-downlink-rate", rawDownlinkRate, "лимит downlink на одну raw-аллокацию, байт/с (0 = без пейсера)")
 	flag.IntVar(&rawDownlinkBurst, "raw-downlink-burst", rawDownlinkBurst, "burst пейсера downlink, байт (0 = без пейсера)")
+	flagRawFlowHash := flag.String("raw-flow-hash", "auto", "привязка downlink потоков: auto (по архитектуре CPU: true для mips/mipsel, false для arm/arm64/x86), true (eco/mips), false (fast/chunked)")
+	flagRawChunkSize := flag.Int("raw-chunk-size", 0, "размер чанка пакетов при raw-flow-hash=false (0 = по умолчанию 8)")
 	flag.Parse()
+	rawFlowHash = resolveRawFlowHash(*flagRawFlowHash)
+	rawChunkSize = resolveRawChunkSize(*flagRawChunkSize)
 	dns = *dnsFlag
 	keeneticNoNAT = *flagNoNAT
 	keeneticNatIface = strings.TrimSpace(*flagNatIface)
