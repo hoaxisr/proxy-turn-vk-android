@@ -13,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"mime/multipart"
@@ -23,6 +24,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -2043,43 +2045,51 @@ func downlinkChunkSizeFor(pktSize int) int {
 	}
 }
 
+func isMIPSArch(arch string) bool {
+	return arch == "mips" || arch == "mipsle"
+}
+
+func defaultDownlinkWorkerBuf(arch string) int {
+	if isMIPSArch(arch) {
+		return 256
+	}
+	return 1024
+}
+
+func defaultRawMaxWorkersPerIP(arch string) int {
+	if isMIPSArch(arch) {
+		return 48
+	}
+	return 96
+}
+
+func defaultRawDownlinkRate(arch string) int {
+	if isMIPSArch(arch) {
+		return 247 * 1024
+	}
+	return 0
+}
+
+func defaultRawDownlinkBurst(arch string) int {
+	if isMIPSArch(arch) {
+		return 16 * 1024
+	}
+	return 0
+}
+
 // downlinkWorkerBuf — глубина канала пакетов, ожидающих отправки через один
-// relay-воркер. Тот же порядок величины, что клиентский returnChBuf (BDP при
-// ~70-80 Мбит/с и RTT 50-60мс), с запасом на то, что здесь общий downlinkLoop
-// раздаёт пакеты быстрее, чем один relay успевает их вытолкнуть в сеть.
-const downlinkWorkerBuf = 256
-
+// relay-воркер (256 на mips/mipsle для экономии RAM, 1024 на arm64/x86).
 // rawMaxWorkersPerIP — потолок числа downlink-воркеров (TURN-реле) на один
-// клиентский IP. Это ПРЕДОХРАНИТЕЛЬ ОТ РАЗРАСТАНИЯ ПАМЯТИ, а не тюнинг
-// производительности: каждый воркер держит очередь downlinkWorkerBuf (256)
-// буферов по 2048 Б, то есть 512 КиБ в полёте, и раньше register() принимал
-// их без всякого ограничения.
-//
-// 48 = 36 штатных + 12 запаса. 36 — штатный максимум клиента (число воркеров
-// кратно 9: 9/18/27/36), запас нужен на слоты мёртвых сессий, которые ещё не
-// сняты по idleTimeout (90 с, см. handleConnRaw) при переподключении. Потолок
-// обязан лежать выше рабочей конфигурации, иначе он сам станет причиной
-// цикла переподключений. Дефолт числа потоков ниже максимума (9 на mips,
-// 27 на arm64), так что 12 слотов запаса — с избытком.
-//
-// По эмпирической модели RSS = 15 + 2.2 × (N × 512 КиБ) МиБ (подтверждена
-// двумя замерами на MT7621 с ошибкой < 5%) 48 воркеров дают ≈ 68 МиБ при
-// 136 МиБ доступных — ровно половина. До линии вытеснения page cache (N≈68)
-// и до линии OOM (N≈110) остаётся запас. Считать надо именно по этой модели:
-// «байты в полёте» (N × 256 × 2048) занижают реальный RSS примерно в 2.5 раза.
-//
-// Значение одно на все архитектуры: при buf 256 различие по арке ничем не
-// обосновано — на mips предел безопасен по той же модели.
-const rawMaxWorkersPerIP = 48
-
-// rawDownlinkRate ограничивает одну TURN-аллокацию немного ниже наблюдаемого
-// VK лимита ~260 KiB/s. Пейсер сглаживает bursts, не меняя протокол клиента.
-// Настраиваются флагами -raw-downlink-rate/-raw-downlink-burst: ноль отключает
-// пейсер (newPacer возвращает nil), и тогда потери переезжают из нашей очереди
-// в шейпер VK — вне наших счётчиков.
+// клиентский IP (48 на mips/mipsle, 96 на arm64/x86 чтобы исключить отказ при
+// перекрытии реконнекта на -n 36).
+// rawDownlinkRate / rawDownlinkBurst — ограничитель на одну TURN-аллокацию:
+// включён по умолчанию на mips/mipsle (247 KiB/s, burst 16 KiB) и отключён на
+// arm64/x86 (0/0), переопределяется флагами -raw-downlink-rate/-raw-downlink-burst.
 var (
-	rawDownlinkRate  = 247 * 1024
-	rawDownlinkBurst = 16 * 1024
+	downlinkWorkerBuf  = defaultDownlinkWorkerBuf(runtime.GOARCH)
+	rawMaxWorkersPerIP = defaultRawMaxWorkersPerIP(runtime.GOARCH)
+	rawDownlinkRate    = defaultRawDownlinkRate(runtime.GOARCH)
+	rawDownlinkBurst   = defaultRawDownlinkBurst(runtime.GOARCH)
 )
 
 // downlinkWorker — per-conn writer: раньше downlinkLoop писал в conn.Write
@@ -2129,18 +2139,26 @@ func (w *downlinkWorker) run() {
 	}
 }
 
+// tryEnqueue пытается положить пакет в очередь без освобождения буфера при переполнении.
+func (w *downlinkWorker) tryEnqueue(pkt []byte) bool {
+	select {
+	case w.sendCh <- pkt:
+		return true
+	default:
+		return false
+	}
+}
+
 // enqueue кладёт пакет в очередь на отправку. Неблокирующе: если воркер
 // отстаёт и канал переполнен, пакет дропается — как и раньше при синхронной
 // записи, отставший relay не должен задерживать остальных или копить
 // неограниченную очередь просроченных данных.
 func (w *downlinkWorker) enqueue(pkt []byte) bool {
-	select {
-	case w.sendCh <- pkt:
-		return true
-	default:
+	if !w.tryEnqueue(pkt) {
 		putBuf2048(pkt)
 		return false
 	}
+	return true
 }
 
 func (w *downlinkWorker) stop() {
@@ -2156,10 +2174,63 @@ type rawClientSessions struct {
 	chunkStartTs int64 // unix millis начала текущего chunk'а — для downlinkMaxDwellMS
 }
 
+var (
+	rawFlowHash  bool
+	rawChunkSize int
+)
+
+func resolveRawFlowHash(val string) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "true", "1", "yes", "on", "eco":
+		return true
+	case "false", "0", "no", "off", "fast":
+		return false
+	case "auto", "":
+		return isMIPSArch(runtime.GOARCH)
+	default:
+		return isMIPSArch(runtime.GOARCH)
+	}
+}
+
+func resolveRawChunkSize(val int) int {
+	if val <= 0 {
+		return 0
+	}
+	return val
+}
+
+// rawAdaptiveChunkSizeFor — адаптивный чанк для ARM/x86 при отключённом
+// пейсере (pacer=0): верхняя ступень 16 пакетов (~20 КБ) удерживает пачку
+// в пределах burst-лимита одной VK TURN аллокации, не срываясь в потери на
+// шейпере VK и одновременно снижая частоту переключений реле вдвое против 8.
+func rawAdaptiveChunkSizeFor(pktSize int) int {
+	switch {
+	case pktSize > 1100:
+		return 16
+	case pktSize >= 701:
+		return 12
+	case pktSize >= 301:
+		return 8
+	case pktSize >= 101:
+		return 3
+	default:
+		return 1
+	}
+}
+
+func formatRawChunkMode(chunkSize int) string {
+	if chunkSize <= 0 {
+		return fmt.Sprintf("auto(16/12/8/3/1,dwell=%dms)", downlinkMaxDwellMS)
+	}
+	return fmt.Sprintf("%d", chunkSize)
+}
+
 type rawRouter struct {
 	file            *os.File
 	mu              sync.RWMutex
 	sessions        map[string]*rawClientSessions // keyed by assigned raw IP клиента
+	flowHash        bool                          // true = 5-tuple flow hash (CPU eco для MIPS), false = chunked round-robin (fast для ARM/x86)
+	chunkSize       int                           // <= 0 означает адаптивный chunk+dwell, > 0 задаёт фиксированный размер чанка
 	uplinkErrLogged uint32                        // чтобы не заспамить лог при устойчивой ошибке записи
 	firstUplink     uint32
 	firstDownlink   uint32
@@ -2234,9 +2305,15 @@ func newRawRouter() (*rawRouter, error) {
 		return nil, err
 	}
 
-	r := &rawRouter{file: tunFile, sessions: make(map[string]*rawClientSessions)}
+	r := &rawRouter{
+		file:      tunFile,
+		sessions:  make(map[string]*rawClientSessions),
+		flowHash:  rawFlowHash,
+		chunkSize: resolveRawChunkSize(rawChunkSize),
+	}
 	go r.downlinkLoop()
-	log.Printf("[RAW] TUN %s поднят (%s), MTU %d", rawIfaceName, rawServerCIDR, rawMTU)
+	log.Printf("[RAW] TUN %s поднят (%s), MTU %d | flow-hash: %v (chunk=%s, pacer=%d/%d, buf=%d, maxWorkers=%d, arch=%s)",
+		rawIfaceName, rawServerCIDR, rawMTU, r.flowHash, formatRawChunkMode(r.chunkSize), rawDownlinkRate, rawDownlinkBurst, downlinkWorkerBuf, rawMaxWorkersPerIP, runtime.GOARCH)
 	return r, nil
 }
 
@@ -2269,58 +2346,108 @@ func (r *rawRouter) downlinkLoop() {
 // пакета в его очередь, НЕ отпуская r.mu между выбором и отправкой. Раньше
 // это были два шага (pickDownlinkConn + enqueue) с отпущенным локом между
 // ними, и в это окно unregister успевал снять воркера и закрыть его sendCh —
-// отправка в закрытый канал роняла паникой весь сервер. Под общим локом
-// close уже не может опередить отправку: unregister закрывает канал только
-// после того, как снял воркера под r.mu, то есть после завершения любой
-// отправки, начатой до снятия.
-// Возвращает false, если сессии для dst нет.
+// ipv4FlowHash — canonical 5-tuple (symmetric with client dispatcher.go).
+func ipv4FlowHash(packet []byte) (uint32, bool) {
+	if len(packet) < 20 || packet[0]>>4 != 4 {
+		return 0, false
+	}
+	ihl := int(packet[0]&0x0f) * 4
+	if ihl < 20 || len(packet) < ihl+4 {
+		return 0, false
+	}
+	proto := packet[9]
+	if proto != 6 && proto != 17 {
+		return 0, false
+	}
+	aIP := packet[12:16]
+	bIP := packet[16:20]
+	aPort := packet[ihl : ihl+2]
+	bPort := packet[ihl+2 : ihl+4]
+	if bytes.Compare(aIP, bIP) > 0 || (bytes.Equal(aIP, bIP) && bytes.Compare(aPort, bPort) > 0) {
+		aIP, bIP = bIP, aIP
+		aPort, bPort = bPort, aPort
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte{proto})
+	_, _ = h.Write(aIP)
+	_, _ = h.Write(aPort)
+	_, _ = h.Write(bIP)
+	_, _ = h.Write(bPort)
+	return h.Sum32(), true
+}
+
 func (r *rawRouter) dispatchDownlink(dst string, pkt []byte) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	w := r.pickDownlinkConnLocked(dst, len(pkt))
-	if w == nil {
+	cs := r.sessions[dst]
+	if cs == nil || len(cs.workers) == 0 {
 		return false
 	}
+	nw := len(cs.workers)
 	// Копируем в pooled-буфер: pkt живёт в общем buf, который downlinkLoop
 	// тут же перезапишет следующим Read — writer-горутина воркера должна
 	// получить свою независимую копию, раз запись теперь асинхронная.
 	out := getBuf2048()[:len(pkt)]
 	copy(out, pkt)
-	w.enqueue(out)
-	return true
-}
 
-// pickDownlinkConnLocked выбирает воркера для очередного downlink-пакета
-// клиента dst, размазывая нагрузку по всем его зарегистрированным воркерам
-// адаптивными чанками (см. downlinkChunkSizeFor) с предохранителем
-// downlinkMaxDwellMS на случай, если текущий relay начал тормозить.
-// Вызывается с уже взятым r.mu.
-func (r *rawRouter) pickDownlinkConnLocked(dst string, pktSize int) *downlinkWorker {
-	cs := r.sessions[dst]
-	if cs == nil || len(cs.workers) == 0 {
-		return nil
+	if r.flowHash {
+		if h, ok := ipv4FlowHash(pkt); ok {
+			cs.workers[int(h%uint32(nw))].enqueue(out)
+			return true
+		}
 	}
-	if cs.rrIndex >= len(cs.workers) {
+
+	chunkLimit := r.chunkSize
+	var now int64
+	if chunkLimit <= 0 {
+		chunkLimit = rawAdaptiveChunkSizeFor(len(pkt))
+		now = time.Now().UnixMilli()
+		if cs.chunkStartTs == 0 {
+			cs.chunkStartTs = now
+		} else if now-cs.chunkStartTs >= downlinkMaxDwellMS {
+			cs.rrIndex = (cs.rrIndex + 1) % nw
+			cs.rrCount = 0
+			cs.chunkStartTs = now
+		}
+	}
+	if cs.rrIndex >= nw {
 		cs.rrIndex = 0
 	}
-
-	now := time.Now().UnixMilli()
-	if cs.chunkStartTs == 0 {
-		cs.chunkStartTs = now
-	} else if now-cs.chunkStartTs >= downlinkMaxDwellMS {
-		cs.rrIndex = (cs.rrIndex + 1) % len(cs.workers)
-		cs.rrCount = 0
+	start := cs.rrIndex
+	if cs.workers[start].tryEnqueue(out) {
+		cs.rrCount++
+		if cs.rrCount >= chunkLimit {
+			cs.rrIndex = (start + 1) % nw
+			cs.rrCount = 0
+			if now != 0 {
+				cs.chunkStartTs = now
+			}
+		}
+		return true
+	}
+	for i := 1; i < nw; i++ {
+		altIdx := (start + i) % nw
+		if cs.workers[altIdx].tryEnqueue(out) {
+			if chunkLimit <= 1 {
+				cs.rrIndex = (altIdx + 1) % nw
+				cs.rrCount = 0
+			} else {
+				cs.rrIndex = altIdx
+				cs.rrCount = 1
+			}
+			if now != 0 {
+				cs.chunkStartTs = now
+			}
+			return true
+		}
+	}
+	putBuf2048(out)
+	cs.rrIndex = (start + 1) % nw
+	cs.rrCount = 0
+	if now != 0 {
 		cs.chunkStartTs = now
 	}
-
-	w := cs.workers[cs.rrIndex]
-	cs.rrCount++
-	if cs.rrCount >= downlinkChunkSizeFor(pktSize) {
-		cs.rrIndex = (cs.rrIndex + 1) % len(cs.workers)
-		cs.rrCount = 0
-		cs.chunkStartTs = now
-	}
-	return w
+	return true
 }
 
 func (r *rawRouter) register(ip string, conn net.Conn, deviceID string) *downlinkWorker {
@@ -2731,7 +2858,11 @@ func main() {
 	flagNatIface := flag.String("nat-if", "", "egress interface for MASQUERADE")
 	flag.IntVar(&rawDownlinkRate, "raw-downlink-rate", rawDownlinkRate, "лимит downlink на одну raw-аллокацию, байт/с (0 = без пейсера)")
 	flag.IntVar(&rawDownlinkBurst, "raw-downlink-burst", rawDownlinkBurst, "burst пейсера downlink, байт (0 = без пейсера)")
+	flagRawFlowHash := flag.String("raw-flow-hash", "auto", "привязка downlink потоков: auto (по архитектуре CPU: true для mips/mipsel, false для arm/arm64/x86), true (eco/mips), false (fast/chunked)")
+	flagRawChunkSize := flag.Int("raw-chunk-size", 0, "размер чанка пакетов при raw-flow-hash=false (0 = адаптивный 16/12/8/3/1, dwell 15ms)")
 	flag.Parse()
+	rawFlowHash = resolveRawFlowHash(*flagRawFlowHash)
+	rawChunkSize = resolveRawChunkSize(*flagRawChunkSize)
 	dns = *dnsFlag
 	keeneticNoNAT = *flagNoNAT
 	keeneticNatIface = strings.TrimSpace(*flagNatIface)
