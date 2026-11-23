@@ -306,6 +306,9 @@ func (s *wrapKeyStore) SetPasswords(generated []string) error {
 	s.entries = next
 	s.mu.Unlock()
 	for _, entry := range old {
+		if _, kept := seen[entry.id]; !kept {
+			evictAEAD(entry.key)
+		}
 		zeroBytes(entry.key)
 	}
 	return nil
@@ -339,6 +342,7 @@ func (s *wrapKeyStore) RemovePassword(password string) {
 		if entry.id != id {
 			continue
 		}
+		evictAEAD(entry.key)
 		zeroBytes(entry.key)
 		copy(s.entries[i:], s.entries[i+1:])
 		s.entries[len(s.entries)-1] = wrapKeyEntry{}
@@ -353,33 +357,58 @@ func (s *wrapKeyStore) Count() int {
 	return len(s.entries)
 }
 
-func (s *wrapKeyStore) Unwrap(raw, dst []byte) ([]byte, int, error) {
+func (s *wrapKeyStore) Unwrap(raw, dst []byte) ([]byte, string, int, error) {
 	if !obfsIsRTPPacket(raw) {
-		return nil, 0, errors.New("wrap: non-obfs packet")
+		return nil, "", 0, errors.New("wrap: non-obfs packet")
 	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if len(s.entries) == 0 {
-		return nil, 0, errors.New("wrap: no active keys")
+		return nil, "", 0, errors.New("wrap: no active keys")
 	}
 	for _, entry := range s.entries {
 		m, err := obfsUnwrapPacket(entry.key, raw, dst)
 		if err == nil {
-			return append([]byte(nil), entry.key...), m, nil
+			return append([]byte(nil), entry.key...), entry.id, m, nil
 		}
 	}
-	return nil, 0, errors.New("wrap: auth failed")
+	return nil, "", 0, errors.New("wrap: auth failed")
 }
 
 func refreshWrapKeysFromDBLocked() error {
 	passwords := make([]string, 0, len(db.Passwords))
 	for password, entry := range db.Passwords {
-		if !isPasswordExpired(entry) {
+		if entry != nil && !entry.IsDeactivated && !isPasswordExpired(entry) {
 			passwords = append(passwords, password)
 		}
 	}
 	return serverWrapKeys.SetPasswords(passwords)
+}
+
+func entryBoundDevices(entry *PasswordEntry) []string {
+	if entry == nil {
+		return nil
+	}
+	if len(entry.DeviceIDs) > 0 {
+		return entry.DeviceIDs
+	}
+	if entry.DeviceID != "" {
+		return []string{entry.DeviceID}
+	}
+	return nil
+}
+
+func passwordEntryHasDevice(entry *PasswordEntry, deviceID string) bool {
+	if entry == nil || deviceID == "" {
+		return false
+	}
+	for _, id := range entry.DeviceIDs {
+		if id == deviceID {
+			return true
+		}
+	}
+	return len(entry.DeviceIDs) == 0 && entry.DeviceID == deviceID
 }
 
 func reloadDB(wgDev *device.Device) error {
@@ -406,6 +435,23 @@ func reloadDB(wgDev *device.Device) error {
 	newDB.BotToken = oldDB.BotToken
 
 	db = newDB
+
+	// Закрываем активные сессии для удалённых, деактивированных и истёкших паролей,
+	// а также для отвязанных от пароля устройств (awg-manager обновляет БД через SIGHUP).
+	if oldDB != nil {
+		for oldPass, oldEntry := range oldDB.Passwords {
+			newEntry, exists := db.Passwords[oldPass]
+			if !exists || newEntry == nil || newEntry.IsDeactivated || isPasswordExpired(newEntry) {
+				disconnectCredentialConnections(oldPass)
+				continue
+			}
+			for _, devID := range entryBoundDevices(oldEntry) {
+				if !passwordEntryHasDevice(newEntry, devID) {
+					disconnectCredentialDeviceConnections(oldPass, devID)
+				}
+			}
+		}
+	}
 
 	// Очищаем истёкшие
 	cleanupExpiredPasswordsLocked(wgDev)
@@ -745,6 +791,8 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					entry, exists := db.Passwords[pass]
 					if exists && entry != nil {
 						entry.IsDeactivated = true
+						disconnectCredentialConnections(pass)
+						serverWrapKeys.RemovePassword(pass)
 						// Отключаем активные устройства от WG
 						if entry.DeviceID != "" {
 							dev, devExists := db.Devices[entry.DeviceID]
@@ -770,6 +818,9 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					dbMutex.Lock()
 					entry, exists := db.Passwords[pass]
 					if exists && entry != nil {
+						if !isPasswordExpired(entry) {
+							_ = serverWrapKeys.AddPassword(pass)
+						}
 						entry.IsDeactivated = false
 						saveDB()
 					}
@@ -813,6 +864,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 					dbMutex.Lock()
 					entry, exists := db.Passwords[pass]
 					if exists && entry != nil {
+						disconnectCredentialConnections(pass)
 						// Удаляем все привязанные устройства из WG и из хранилища
 						if entry.DeviceID != "" {
 							dev, devExists := db.Devices[entry.DeviceID]
@@ -860,6 +912,7 @@ func botLoop(token string, adminIDstr string, wgDev *device.Device) {
 						}
 					}
 					delete(db.Passwords, pass)
+					disconnectCredentialConnections(pass)
 					serverWrapKeys.RemovePassword(pass)
 					saveDB()
 					dbMutex.Unlock()
@@ -1120,9 +1173,12 @@ func cleanupExpiredPasswordsLocked(wgDev *device.Device) int {
 	removed := 0
 	for p, entry := range db.Passwords {
 		if isPasswordExpired(entry) {
-			if entry != nil && entry.DeviceID != "" {
-				removePeerFromWG(wgDev, db.Devices[entry.DeviceID])
-				delete(db.Devices, entry.DeviceID)
+			disconnectCredentialConnections(p)
+			if entry != nil {
+				for _, id := range entryBoundDevices(entry) {
+					removePeerFromWG(wgDev, db.Devices[id])
+					delete(db.Devices, id)
+				}
 			}
 			delete(db.Passwords, p)
 			serverWrapKeys.RemovePassword(p)
@@ -1890,6 +1946,52 @@ func openWGTun() (tun.Device, error) {
 // сразу после hello, но на mips сокет поднимается 4-5 секунд, и запас нужен.
 const awgmTunWait = 30 * time.Second
 
+type loopbackOnlyBind struct {
+	conn.Bind
+}
+
+func (b *loopbackOnlyBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
+	receivers, actualPort, err := b.Bind.Open(port)
+	if err != nil {
+		return nil, 0, err
+	}
+	wrapped := make([]conn.ReceiveFunc, len(receivers))
+	for i, receive := range receivers {
+		inner := receive
+		wrapped[i] = func(packets [][]byte, sizes []int, endpoints []conn.Endpoint) (int, error) {
+			for {
+				n, receiveErr := inner(packets, sizes, endpoints)
+				if receiveErr != nil {
+					return 0, receiveErr
+				}
+				kept := 0
+				for j := 0; j < n; j++ {
+					if endpoints[j] == nil || !endpoints[j].DstIP().IsLoopback() {
+						continue
+					}
+					if kept != j {
+						packets[kept] = packets[j]
+						sizes[kept] = sizes[j]
+						endpoints[kept] = endpoints[j]
+					}
+					kept++
+				}
+				if kept > 0 {
+					return kept, nil
+				}
+			}
+		}
+	}
+	return wrapped, actualPort, nil
+}
+
+func (b *loopbackOnlyBind) Send(bufs [][]byte, endpoint conn.Endpoint) error {
+	if endpoint == nil || !endpoint.DstIP().IsLoopback() {
+		return fmt.Errorf("WireGuard endpoint outside loopback rejected")
+	}
+	return b.Bind.Send(bufs, endpoint)
+}
+
 func startUserspaceWG(keys *wgKeys, wgPort int) (*device.Device, error) {
 	tunDev, err := openWGTun()
 	if err != nil {
@@ -1903,7 +2005,7 @@ func startUserspaceWG(keys *wgKeys, wgPort int) (*device.Device, error) {
 	}
 
 	logger := device.NewLogger(device.LogLevelError, "[WG] ")
-	bind := conn.NewDefaultBind()
+	bind := &loopbackOnlyBind{Bind: conn.NewDefaultBind()}
 	dev := device.NewDevice(tunDev, bind, logger)
 
 	serverPrivHex, _ := b64ToHex(keys.serverPrivate)
@@ -2543,6 +2645,10 @@ func handleConnRaw(ctx context.Context, clientConn net.Conn, router *rawRouter) 
 	if len(parts) > 1 {
 		password = parts[1]
 	}
+	if !connectionCredentialMatches(clientConn, password) {
+		clientConn.Write([]byte("DENIED:wrong_password"))
+		return
+	}
 
 	var assignedIP string
 
@@ -2593,11 +2699,15 @@ func handleConnRaw(ctx context.Context, clientConn net.Conn, router *rawRouter) 
 			return
 		}
 	} else {
-		// AUTH-путь (остальные воркеры группы): как и в классическом handleConn,
-		// пароль здесь не проверяется — авторизацию уже подтвердил obfs WRAP-ключ
-		// (без верного пароля пакет не прошёл бы аутентификацию на уровне obfs),
-		// нужен только IP устройства, чтобы зарегистрировать сессию в роутере.
+		// AUTH-путь (остальные воркеры группы): проверяем, что пароль
+		// активен и устройство уже привязано к нему, плюс достаём RawIP.
 		dbMutex.Lock()
+		entry, valid := passwordAccepted(password)
+		if !valid || entry == nil || entry.IsDeactivated || !passwordEntryHasDevice(entry, deviceID) {
+			dbMutex.Unlock()
+			clientConn.Write([]byte("DENIED:device_mismatch"))
+			return
+		}
 		dev, exists := db.Devices[deviceID]
 		if exists && dev.RawIP == "" {
 			dev.RawIP = getNextRawIP()
@@ -2613,6 +2723,9 @@ func handleConnRaw(ctx context.Context, clientConn net.Conn, router *rawRouter) 
 			return
 		}
 	}
+
+	untrackCredential := trackCredentialConnection(password, deviceID, clientConn)
+	defer untrackCredential()
 
 	dlWorker := router.register(assignedIP, clientConn, deviceID)
 	if dlWorker == nil {
@@ -2673,6 +2786,7 @@ func handleConnRaw(ctx context.Context, clientConn net.Conn, router *rawRouter) 
 		// IPv4-пакета всегда 0x45 (версия 4, IHL 5) и никогда не 0xFF, так
 		// что разбор по первому байту безопасен для любой длины.
 		if nn > 0 && (*b)[0] == 0xFF {
+			answerKeepalive(clientConn, nn)
 			continue // keepalive
 		}
 		if strings.HasPrefix(string((*b)[:nn]), "DISCONNECT_RAW:") {
@@ -2832,6 +2946,7 @@ func handleAPIProfileUnbind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	disconnectCredentialDeviceConnections(password, deviceID)
 	unbindDevices(entry, deviceID)
 	saveDB()
 
@@ -2918,6 +3033,21 @@ func main() {
 
 	initDB(*configDir, *mainPass, *adminID, *botToken)
 
+	// Ключ диагностики (netdiag.go): без него сервер отвечает только на
+	// пробы ключом пароля. Не фатально — туннель работает и так.
+	if secret, err := loadOrCreateDiagSecret(*configDir); err != nil {
+		log.Printf("[DIAG] Ключ диагностики недоступен: %v", err)
+	} else if err := serverDiag.configure(secret); err != nil {
+		log.Printf("[DIAG] Ключ диагностики: %v", err)
+	}
+	serverDiag.setPort("dtls", *listen)
+	if *listenDirect != "" {
+		serverDiag.setPort("direct", *listenDirect)
+	}
+	if *listenRaw != "" {
+		serverDiag.setPort("raw", *listenRaw)
+	}
+
 	keys, err := loadOrGenerateKeys(*configDir)
 	if err != nil {
 		log.Fatalf("[WG] Ключи: %v", err)
@@ -2971,7 +3101,7 @@ func main() {
 		log.Fatalf("[WRAP] нет активных паролей для WRAP")
 	}
 
-	wrapListener, err := listenWrapped(addr, serverWrapKeys)
+	wrapListener, err := listenWrapped("dtls", addr, serverWrapKeys)
 	if err != nil {
 		log.Fatalf("[WRAP] %v", err)
 	}
@@ -2998,7 +3128,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("[DIRECT] адрес: %v", err)
 		}
-		directWrapListener, err := listenWrapped(directAddr, serverWrapKeys)
+		directWrapListener, err := listenWrapped("direct", directAddr, serverWrapKeys)
 		if err != nil {
 			log.Fatalf("[DIRECT] %v", err)
 		}
@@ -3040,7 +3170,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("[RAW] адрес: %v", err)
 		}
-		rawWrapListener, err := listenWrapped(rawAddr, serverWrapKeys)
+		rawWrapListener, err := listenWrapped("raw", rawAddr, serverWrapKeys)
 		if err != nil {
 			log.Fatalf("[RAW] %v", err)
 		}
@@ -3091,6 +3221,56 @@ func main() {
 	}
 }
 
+var credentialConnections = struct {
+	sync.Mutex
+	items map[string]map[net.Conn]string
+}{items: make(map[string]map[net.Conn]string)}
+
+func trackCredentialConnection(password, deviceID string, conn net.Conn) func() {
+	ownerID := wrapKeyID(password)
+	credentialConnections.Lock()
+	connections := credentialConnections.items[ownerID]
+	if connections == nil {
+		connections = make(map[net.Conn]string)
+		credentialConnections.items[ownerID] = connections
+	}
+	connections[conn] = deviceID
+	credentialConnections.Unlock()
+	return func() {
+		credentialConnections.Lock()
+		delete(connections, conn)
+		if len(connections) == 0 {
+			delete(credentialConnections.items, ownerID)
+		}
+		credentialConnections.Unlock()
+	}
+}
+
+func disconnectCredentialConnections(password string) {
+	disconnectCredentialDeviceConnections(password, "")
+}
+
+func disconnectCredentialDeviceConnections(password, deviceID string) {
+	ownerID := wrapKeyID(password)
+	credentialConnections.Lock()
+	connections := credentialConnections.items[ownerID]
+	list := make([]net.Conn, 0, len(connections))
+	for conn, activeDeviceID := range connections {
+		if deviceID != "" && activeDeviceID != deviceID {
+			continue
+		}
+		list = append(list, conn)
+		delete(connections, conn)
+	}
+	if len(connections) == 0 {
+		delete(credentialConnections.items, ownerID)
+	}
+	credentialConnections.Unlock()
+	for _, conn := range list {
+		conn.Close()
+	}
+}
+
 // ==================== Обработка соединений ====================
 
 // directConn — net.Conn поверх уже обфусцированного (RTP-obfs AEAD) UDP-потока
@@ -3104,11 +3284,14 @@ func (c *directConn) Read(b []byte) (int, error) {
 	// wrapPacketConn.ReadFrom возвращает ошибку и на битый/нерасшифрованный
 	// пакет (обычное дело при потерях/переупорядочивании на мобильной сети),
 	// и на настоящий сбой сокета. Раньше любая из них рвала всю сессию —
-	// один битый пакет убивал воркера. Ретраим всё, кроме net.Error (реальная
-	// сетевая ошибка/таймаут/закрытие), как уже делает клиентский obfsDirectConn.Read.
+	// один битый пакет убивал воркера. Ретраим всё, кроме net.Error и
+	// диагностической пробы (errDiagnosticProbe — ответ уже ушёл, закрываем сразу).
 	for {
 		n, _, err := c.pc.ReadFrom(b)
 		if err != nil {
+			if errors.Is(err, errDiagnosticProbe) {
+				return 0, err
+			}
 			var netErr net.Error
 			if errors.As(err, &netErr) {
 				return 0, err
@@ -3132,6 +3315,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 	atomic.AddInt64(&totalConns, 1)
 
 	var connDeviceID string
+	var authenticatedPassword string
 
 	// DTLS-клиенты (обратная совместимость): хендшейк перед чтением данных.
 	// Прямые (-notls) клиенты приходят уже как directConn — RTP-obfs AEAD
@@ -3140,7 +3324,9 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		hctx, hcancel := context.WithTimeout(ctx, 60*time.Second)
 		if err := dtlsConn.HandshakeContext(hctx); err != nil {
 			hcancel()
-			log.Printf("[DTLS] [ERR] Handshake failed from %s: %v", clientConn.RemoteAddr().String(), err)
+			if !strings.Contains(err.Error(), errDiagnosticProbe.Error()) {
+				log.Printf("[DTLS] [ERR] Handshake failed from %s: %v", clientConn.RemoteAddr().String(), err)
+			}
 			return
 		}
 		hcancel()
@@ -3174,6 +3360,10 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		if len(parts) > 2 {
 			password = parts[2]
 		}
+		if !connectionCredentialMatches(clientConn, password) {
+			clientConn.Write([]byte("DENIED:wrong_password"))
+			return
+		}
 
 		dbMutex.Lock()
 
@@ -3185,13 +3375,16 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			clientConn.Write([]byte("DENIED:deactivated"))
 			log.Printf("[WG] Отказ: пароль %s деактивирован, запрос от %s", maskPassword(password), deviceID)
 			dbMutex.Unlock()
+			return
 		} else if valid && !entry.canConnectAndBind(deviceID) {
 			// Достигнут лимит устройств или привязано к другому устройству
 			clientConn.Write([]byte("DENIED:device_mismatch"))
 			log.Printf("[WG] Отказ: пароль %s достиг лимита устройств (%d), запрос от %s", maskPassword(password), entry.MaxDevices, deviceID)
 			dbMutex.Unlock()
+			return
 		} else if valid {
 			connDeviceID = deviceID
+			authenticatedPassword = password
 
 			// Сохраняем БД, так как canConnectAndBind мог внести привязку нового устройства
 			saveDB()
@@ -3227,6 +3420,8 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				clientConn.Write([]byte(buildClientConfig(keys.serverPublic, dev.PrivKey, dev.IP, clientPort)))
 			} else {
 				clientConn.Write([]byte("NOCONF"))
+				dbMutex.Unlock()
+				return
 			}
 			dbMutex.Unlock()
 		} else {
@@ -3238,6 +3433,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				log.Printf("[WG] Отказ (неверный пароль) от %s", deviceID)
 			}
 			dbMutex.Unlock()
+			return
 		}
 
 		clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
@@ -3251,11 +3447,30 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 	} else if strings.HasPrefix(firstStr, "AUTH:") {
 		parts := strings.Split(strings.TrimSpace(strings.TrimPrefix(firstStr, "AUTH:")), "|")
 		deviceID := "unknown"
+		password := ""
 		if len(parts) > 0 {
 			deviceID = parts[0]
 		}
+		if len(parts) > 1 {
+			password = parts[1]
+		}
+		if !connectionCredentialMatches(clientConn, password) {
+			clientConn.Write([]byte("DENIED:wrong_password"))
+			return
+		}
+
+		dbMutex.Lock()
+		entry, valid := passwordAccepted(password)
+		if !valid || entry == nil || entry.IsDeactivated || !passwordEntryHasDevice(entry, deviceID) {
+			dbMutex.Unlock()
+			clientConn.Write([]byte("DENIED:device_mismatch"))
+			return
+		}
+		saveDB()
+		dbMutex.Unlock()
 
 		connDeviceID = deviceID
+		authenticatedPassword = password
 
 		clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		n, err = clientConn.Read(buf)
@@ -3266,6 +3481,11 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		firstPacket = buf[:n]
 		firstStr = string(firstPacket)
 	}
+	if authenticatedPassword == "" {
+		return
+	}
+	untrackCredential := trackCredentialConnection(authenticatedPassword, connDeviceID, clientConn)
+	defer untrackCredential()
 
 	if firstStr == "READY" {
 		clientConn.Write([]byte("READY_OK"))
@@ -3343,6 +3563,7 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			// handleConnRaw. WireGuard-пакеты всегда начинаются с байта
 			// типа сообщения 1-4, никогда не 0xFF.
 			if nn > 0 && (*b)[0] == 0xFF {
+				answerKeepalive(clientConn, nn)
 				continue
 			}
 			atomic.AddInt64(&totalBytesFromClient, int64(nn))
@@ -3391,6 +3612,23 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 
 const wrapKeyLen = 32
 
+const keepaliveByte = 0xFF
+
+// keepalivePong — ответ на keepalive клиента: один байт 0xFF. По нему
+// клиент понимает, что поток жив (go_client/liveness.go), и снимает
+// зависший поток. На однобайтовые keepalive самых старых клиентов не
+// отвечаем (n < 2), чтобы исключить любой пинг-понг.
+var keepalivePong = []byte{keepaliveByte}
+
+func answerKeepalive(conn net.Conn, n int) {
+	if n < 2 || conn == nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, _ = conn.Write(keepalivePong)
+	_ = conn.SetWriteDeadline(time.Time{})
+}
+
 // ==================== RTP Обфускация ====================
 
 type ObfsConfig struct {
@@ -3400,6 +3638,68 @@ type ObfsConfig struct {
 }
 
 var aeadCache sync.Map
+var wrapCredentialBindings sync.Map
+
+const replayWindowSpan = uint64(4096 * 961)
+const replayWindowMaxEntries = 8192
+
+type replayWindow struct {
+	mu          sync.Mutex
+	seen        map[[12]byte]uint64
+	ssrc        uint32
+	highestTime uint64
+	initialized bool
+}
+
+func (w *replayWindow) accept(wire []byte) bool {
+	if len(wire) < rtpHeaderLen {
+		return false
+	}
+	ssrc := binary.BigEndian.Uint32(wire[8:12])
+	seq := binary.BigEndian.Uint16(wire[2:4])
+	ts := binary.BigEndian.Uint32(wire[4:8])
+	var nonce [12]byte
+	copy(nonce[:], obfsBuildNonce(ssrc, seq, ts))
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.initialized {
+		w.ssrc = ssrc
+		w.highestTime = uint64(ts)
+		w.seen = make(map[[12]byte]uint64, 4096)
+		w.initialized = true
+	} else if w.ssrc != ssrc {
+		return false
+	}
+	if _, exists := w.seen[nonce]; exists {
+		return false
+	}
+	base := w.highestTime &^ uint64(0xffffffff)
+	extended := base | uint64(ts)
+	if extended+(1<<31) < w.highestTime {
+		extended += 1 << 32
+	} else if extended > w.highestTime+(1<<31) && extended >= 1<<32 {
+		extended -= 1 << 32
+	}
+	if extended+replayWindowSpan < w.highestTime {
+		return false
+	}
+	if extended > w.highestTime {
+		w.highestTime = extended
+	}
+	if len(w.seen) >= replayWindowMaxEntries {
+		cutoff := w.highestTime - min(w.highestTime, replayWindowSpan)
+		for value, packetTime := range w.seen {
+			if packetTime < cutoff {
+				delete(w.seen, value)
+			}
+		}
+		if len(w.seen) >= replayWindowMaxEntries {
+			return false
+		}
+	}
+	w.seen[nonce] = extended
+	return true
+}
 
 func getAEAD(key []byte) (cipher.AEAD, error) {
 	if len(key) != wrapKeyLen {
@@ -3417,6 +3717,12 @@ func getAEAD(key []byte) (cipher.AEAD, error) {
 	return aead, nil
 }
 
+func evictAEAD(key []byte) {
+	if len(key) == wrapKeyLen {
+		aeadCache.Delete(string(key))
+	}
+}
+
 type ObfsState struct {
 	mu      sync.Mutex
 	initSeq uint16
@@ -3424,9 +3730,11 @@ type ObfsState struct {
 	count   uint64
 }
 
-func NewObfsConfig(mode string) *ObfsConfig {
+func NewObfsConfig(mode string) (*ObfsConfig, error) {
 	var buf [4]byte
-	rand.Read(buf[:])
+	if _, err := rand.Read(buf[:]); err != nil {
+		return nil, err
+	}
 	pt := uint8(111)
 	pad := 24
 	if strings.EqualFold(strings.TrimSpace(mode), "video") {
@@ -3437,17 +3745,19 @@ func NewObfsConfig(mode string) *ObfsConfig {
 		SSRC:        binary.BigEndian.Uint32(buf[:]),
 		PayloadType: pt,
 		PaddingMax:  pad,
-	}
+	}, nil
 }
 
-func NewObfsState() *ObfsState {
+func NewObfsState() (*ObfsState, error) {
 	var buf [6]byte
-	rand.Read(buf[:])
+	if _, err := rand.Read(buf[:]); err != nil {
+		return nil, err
+	}
 	return &ObfsState{
 		initSeq: binary.BigEndian.Uint16(buf[0:2]),
 		initTs:  binary.BigEndian.Uint32(buf[2:6]),
 		count:   0,
-	}
+	}, nil
 }
 
 func obfsBuildNonce(ssrc uint32, seq uint16, ts uint32) []byte {
@@ -3486,7 +3796,9 @@ func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState, dst 
 	padRand := 0
 	if cfg.PaddingMax > 0 {
 		var rndBuf [1]byte
-		rand.Read(rndBuf[:])
+		if _, err := rand.Read(rndBuf[:]); err != nil {
+			return nil, fmt.Errorf("obfs: padding random: %w", err)
+		}
 		padRand = int(rndBuf[0]) % cfg.PaddingMax
 	}
 	padTotal := padRand + 1
@@ -3511,7 +3823,9 @@ func obfsWrapPacket(key, payload []byte, cfg *ObfsConfig, state *ObfsState, dst 
 	sealed := aead.Seal(out[rtpHeaderLen:rtpHeaderLen], nonce, payload, out[:rtpHeaderLen])
 	padStart := rtpHeaderLen + len(sealed)
 	if padRand > 0 {
-		rand.Read(out[padStart : padStart+padRand])
+		if _, err := rand.Read(out[padStart : padStart+padRand]); err != nil {
+			return nil, fmt.Errorf("obfs: padding bytes: %w", err)
+		}
 	}
 	out[outLen-1] = byte(padTotal)
 	return out, nil
@@ -3575,7 +3889,9 @@ func obfsIsRTPPacket(wire []byte) bool {
 // молчаливых ENOBUFS-дропов под всплеском нагрузки.
 const socketBufSize = 8 * 1024 * 1024
 
-func listenWrapped(addr *net.UDPAddr, keys *wrapKeyStore) (dtlsnet.PacketListener, error) {
+// listenWrapped поднимает UDP-листенер с RTP-obfs. name — "dtls", "direct"
+// или "raw": попадает в ответы на диагностические пробы и в журнал.
+func listenWrapped(name string, addr *net.UDPAddr, keys *wrapKeyStore) (dtlsnet.PacketListener, error) {
 	if keys == nil || keys.Count() == 0 {
 		return nil, errors.New("wrap: no active keys")
 	}
@@ -3587,12 +3903,14 @@ func listenWrapped(addr *net.UDPAddr, keys *wrapKeyStore) (dtlsnet.PacketListene
 	return &wrapPacketListener{
 		inner: dtlsnet.PacketListenerFromListener(inner),
 		keys:  keys,
+		name:  name,
 	}, nil
 }
 
 type wrapPacketListener struct {
 	inner dtlsnet.PacketListener
 	keys  *wrapKeyStore
+	name  string
 }
 
 func (l *wrapPacketListener) Accept() (net.PacketConn, net.Addr, error) {
@@ -3600,7 +3918,7 @@ func (l *wrapPacketListener) Accept() (net.PacketConn, net.Addr, error) {
 	if err != nil {
 		return pc, addr, err
 	}
-	return &wrapPacketConn{inner: pc, keys: l.keys}, addr, nil
+	return &wrapPacketConn{inner: pc, keys: l.keys, listener: l.name}, addr, nil
 }
 
 func (l *wrapPacketListener) Close() error   { return l.inner.Close() }
@@ -3609,16 +3927,49 @@ func (l *wrapPacketListener) Addr() net.Addr { return l.inner.Addr() }
 type wrapPacketConn struct {
 	inner     net.PacketConn
 	keys      *wrapKeyStore
+	listener  string // dtls / direct / raw — см. listenWrapped
 	key       []byte
+	keyID     string
+	bindingID string
 	selected  int32
 	authLog   int32
 	obfsCfg   *ObfsConfig
 	obfsWrite *ObfsState
+	replay    replayWindow
+}
+
+func wrapConnectionBindingID(local, remote net.Addr) string {
+	if local == nil || remote == nil {
+		return ""
+	}
+	return local.String() + "|" + remote.String()
+}
+
+func isPipeAddr(addr net.Addr) bool {
+	return addr != nil && addr.Network() == "pipe"
+}
+
+// connectionCredentialMatches проверяет, что пароль в GETCONF/AUTH совпадает
+// с тем WRAP-ключом, которым расшифровано соединение на транспорте. Для
+// внутрипроцессных net.Pipe() в модульных тестах (где wrapPacketConn не
+// участвует) допускается отсутствие записи в wrapCredentialBindings.
+func connectionCredentialMatches(conn net.Conn, password string) bool {
+	if conn == nil || password == "" {
+		return false
+	}
+	id := wrapConnectionBindingID(conn.LocalAddr(), conn.RemoteAddr())
+	if value, ok := wrapCredentialBindings.Load(id); ok {
+		return value == "pass:"+wrapKeyID(password)
+	}
+	if isPipeAddr(conn.LocalAddr()) && isPipeAddr(conn.RemoteAddr()) {
+		return true
+	}
+	return false
 }
 
 // wrapReadBufPool — промежуточный буфер под RTP-заголовок+AEAD-тег+padding
 // поверх p (см. ReadFrom ниже). Раньше аллоцировался заново на КАЖДЫЙ входящий
-// пакет — при сотнях клиентов и тысячах pps это заметное GC-давление в
+// пакет — при сотнях клиентов и тысях pps это заметное GC-давление в
 // downlink-пути. p приходит из bufPool (1600 байт, см. handleConn/handleConnRaw),
 // поэтому 1700 с запасом хватает под len(p)+80.
 var wrapReadBufPool = sync.Pool{
@@ -3644,23 +3995,53 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	raw := buf[:n]
 
 	if atomic.LoadInt32(&c.selected) == 0 {
-		key, m, uErr := c.keys.Unwrap(raw, p)
+		key, keyID, m, uErr := c.keys.Unwrap(raw, p)
 		if uErr != nil {
+			// Проба ключом диагностики сервера (см. netdiag.go): отвечаем и
+			// закрываем соединение, сессию по этому ключу не открываем.
+			if serverDiag.tryDiagKey(c, raw, p, addr) {
+				return 0, addr, errDiagnosticProbe
+			}
+			if obfsIsRTPPacket(raw) {
+				serverDiag.noteAuthFailure(c.listener, addr)
+			}
 			if atomic.CompareAndSwapInt32(&c.authLog, 0, 1) {
 				log.Printf("[WRAP] Отказ: RTP AEAD auth failed from %s (keys=%d)", addr.String(), c.keys.Count())
 			}
 			return 0, addr, uErr
 		}
-		c.key = append([]byte(nil), key...) // Клонируем ключ в независимую память!
-		c.obfsCfg = NewObfsConfig("audio")
+		if req, ok := parseDiagRequest(p[:m]); ok {
+			// Проба ключом пароля: пароль верный, сообщаем его статус.
+			serverDiag.answerDiagProbe(c, raw, req, key, keyID, addr)
+			zeroBytes(key)
+			return 0, addr, errDiagnosticProbe
+		}
+		cfg, cfgErr := NewObfsConfig("audio")
+		if cfgErr != nil {
+			zeroBytes(key)
+			return 0, addr, fmt.Errorf("wrap: random config: %w", cfgErr)
+		}
+		writeState, stateErr := NewObfsState()
+		if stateErr != nil {
+			zeroBytes(key)
+			return 0, addr, fmt.Errorf("wrap: random state: %w", stateErr)
+		}
+		c.key = key
+		c.keyID = keyID
+		c.bindingID = wrapConnectionBindingID(c.LocalAddr(), addr)
+		wrapCredentialBindings.Store(c.bindingID, keyID)
+		c.obfsCfg = cfg
 		if len(raw) > 1 {
 			c.obfsCfg.PayloadType = raw[1] & 0x7F
 			if c.obfsCfg.PayloadType == 96 {
 				c.obfsCfg.PaddingMax = 60
 			}
 		}
-		c.obfsWrite = NewObfsState()
+		c.obfsWrite = writeState
 		atomic.StoreInt32(&c.selected, 1)
+		if !c.replay.accept(raw) {
+			return 0, addr, errors.New("wrap: replay")
+		}
 		if atomic.CompareAndSwapInt32(&c.authLog, 0, 1) {
 			log.Printf("[WRAP] OK: ключ выбран для %s (keys=%d)", addr.String(), c.keys.Count())
 		}
@@ -3671,21 +4052,45 @@ func (c *wrapPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if uErr != nil {
 		// Если расшифровка старым ключом провалилась — возможно, пароль обновился!
 		// Пробуем пере-верифицировать пакет по всем активным ключам
-		key, m2, uErr2 := c.keys.Unwrap(raw, p)
+		key, keyID, m2, uErr2 := c.keys.Unwrap(raw, p)
 		if uErr2 == nil {
-			c.key = append([]byte(nil), key...) // На лету обновляем ключ сессии!
-			c.obfsCfg = NewObfsConfig("audio")
+			if !bytes.Equal(key, c.key) {
+				c.replay = replayWindow{}
+				zeroBytes(c.key)
+			}
+			if !c.replay.accept(raw) {
+				zeroBytes(key)
+				return 0, addr, errors.New("wrap: replay")
+			}
+			cfg, cfgErr := NewObfsConfig("audio")
+			if cfgErr != nil {
+				zeroBytes(key)
+				return 0, addr, fmt.Errorf("wrap: random config: %w", cfgErr)
+			}
+			writeState, stateErr := NewObfsState()
+			if stateErr != nil {
+				zeroBytes(key)
+				return 0, addr, fmt.Errorf("wrap: random state: %w", stateErr)
+			}
+			c.key = key
+			c.keyID = keyID
+			c.bindingID = wrapConnectionBindingID(c.LocalAddr(), addr)
+			wrapCredentialBindings.Store(c.bindingID, keyID)
+			c.obfsCfg = cfg
 			if len(raw) > 1 {
 				c.obfsCfg.PayloadType = raw[1] & 0x7F
 				if c.obfsCfg.PayloadType == 96 {
 					c.obfsCfg.PaddingMax = 60
 				}
 			}
-			c.obfsWrite = NewObfsState()
+			c.obfsWrite = writeState
 			log.Printf("[WRAP] Обновлен ключ на лету для %s (пароль изменился/обновился)", addr.String())
 			return m2, addr, nil
 		}
 		return 0, addr, fmt.Errorf("obfs unwrap: %w", uErr)
+	}
+	if !c.replay.accept(raw) {
+		return 0, addr, errors.New("wrap: replay")
 	}
 	return m, addr, nil
 }
@@ -3695,8 +4100,16 @@ func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		return 0, errors.New("wrap: key not selected")
 	}
 	if c.obfsCfg == nil || c.obfsWrite == nil {
-		c.obfsCfg = NewObfsConfig("audio")
-		c.obfsWrite = NewObfsState()
+		cfg, cfgErr := NewObfsConfig("audio")
+		if cfgErr != nil {
+			return 0, fmt.Errorf("wrap: random config: %w", cfgErr)
+		}
+		writeState, stateErr := NewObfsState()
+		if stateErr != nil {
+			return 0, fmt.Errorf("wrap: random state: %w", stateErr)
+		}
+		c.obfsCfg = cfg
+		c.obfsWrite = writeState
 	}
 	bufPtr := wrapReadBufPool.Get().(*[]byte)
 	defer wrapReadBufPool.Put(bufPtr)
@@ -3710,7 +4123,15 @@ func (c *wrapPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return len(p), nil
 }
 
-func (c *wrapPacketConn) Close() error                       { return c.inner.Close() }
+func (c *wrapPacketConn) Close() error {
+	if c.bindingID != "" {
+		wrapCredentialBindings.Delete(c.bindingID)
+	}
+	key := c.key
+	c.key = nil
+	zeroBytes(key)
+	return c.inner.Close()
+}
 func (c *wrapPacketConn) LocalAddr() net.Addr                { return c.inner.LocalAddr() }
 func (c *wrapPacketConn) SetDeadline(t time.Time) error      { return c.inner.SetDeadline(t) }
 func (c *wrapPacketConn) SetReadDeadline(t time.Time) error  { return c.inner.SetReadDeadline(t) }
