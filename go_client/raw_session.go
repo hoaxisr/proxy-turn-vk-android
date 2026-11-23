@@ -49,6 +49,7 @@ func RunRawSession(
 	creds *Credentials,
 	deviceID, password string,
 	stats *Stats,
+	allocateGate <-chan time.Time,
 ) (bool, error) {
 	configDelivered := false
 	var firstWrapUp uint32
@@ -56,37 +57,19 @@ func RunRawSession(
 	var firstPeerWrite uint32
 	var firstPeerRead uint32
 
-	if len(creds.TurnURLs) == 0 {
-		return false, fmt.Errorf("нет TURN URL в учетных данных")
-	}
-	selectedURL := creds.TurnURLs[sessionID%len(creds.TurnURLs)]
-
-	urlhost, urlport, err := net.SplitHostPort(selectedURL)
+	target, err := selectTurnTarget(tp, creds.TurnURLs, sessionID)
 	if err != nil {
-		return false, fmt.Errorf("разбор TURN URL %q: %w", selectedURL, err)
+		return false, err
 	}
-	if tp.Host != "" {
-		urlhost = tp.Host
-	}
-	if tp.Port != "" {
-		urlport = tp.Port
-	}
-	turnAddr := net.JoinHostPort(urlhost, urlport)
+	turnAddr := target.Addr
 
-	resolved, err := net.ResolveUDPAddr("udp", turnAddr)
+	turnConn, turnConnCloser, err := dialTURNConn(ctx, target)
 	if err != nil {
-		return false, fmt.Errorf("резолв TURN: %w", err)
+		return false, err
 	}
-	c, err := net.DialUDP("udp", nil, resolved)
-	if err != nil {
-		return false, fmt.Errorf("подключение TURN UDP: %w", err)
-	}
-	defer c.Close()
-	_ = c.SetReadBuffer(socketBufSize)
-	_ = c.SetWriteBuffer(socketBufSize)
-	var turnConn net.PacketConn = &connectedUDPConn{c}
+	defer turnConnCloser.Close()
 
-	log.Printf("[RAW #%d] TURN UDP (%s)", sessionID, turnAddr)
+	log.Printf("[RAW #%d] TURN %s (%s)", sessionID, strings.ToUpper(target.Transport), turnAddr)
 
 	var addrFamily turn.RequestedAddressFamily
 	if peer.IP.To4() != nil {
@@ -112,6 +95,14 @@ func RunRawSession(
 
 	if err = tc.Listen(); err != nil {
 		return false, fmt.Errorf("TURN Listen: %w", err)
+	}
+
+	if allocateGate != nil {
+		select {
+		case <-allocateGate:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
 	}
 
 	relay, err := tc.Allocate()
@@ -141,7 +132,7 @@ func RunRawSession(
 	sessionWg.Add(1)
 	go func() {
 		defer sessionWg.Done()
-		t := time.NewTicker(5 * time.Second)
+		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
 		for {
 			select {
@@ -149,9 +140,6 @@ func RunRawSession(
 				return
 			case <-t.C:
 				tc.SendBindingRequest()
-				// Сервер отбрасывает пакеты с первым байтом keepaliveByte
-				// (handleConnRaw), поэтому канал держится живым без вреда трафику.
-				_, _ = plainConn.Write([]byte{keepaliveByte})
 			}
 		}
 	}()
@@ -163,8 +151,14 @@ func RunRawSession(
 	var obfsCfg *ObfsConfig
 	var obfsWriteState *ObfsState
 	if useWrap {
-		obfsCfg = NewObfsConfig(tp.ObfsMode)
-		obfsWriteState = NewObfsState()
+		obfsCfg, err = NewObfsConfig(tp.ObfsMode)
+		if err != nil {
+			return false, fmt.Errorf("RTP-obfs config: %w", err)
+		}
+		obfsWriteState, err = NewObfsState()
+		if err != nil {
+			return false, fmt.Errorf("RTP-obfs state: %w", err)
+		}
 	}
 
 	stopRelay := context.AfterFunc(sessCtx, func() {
@@ -179,6 +173,7 @@ func RunRawSession(
 		readBufLen := readBufSize + 80
 		buf := make([]byte, readBufLen)
 		plain := make([]byte, readBufSize)
+		var replay replayWindow
 		for {
 			n, _, readErr := relay.ReadFrom(buf)
 			if readErr != nil {
@@ -193,6 +188,9 @@ func RunRawSession(
 				m, wrapErr := obfsUnwrapPacket(tp.WrapKey, payload, plain)
 				if wrapErr != nil {
 					log.Printf("[RAW #%d] OBFS unwrap: %v (n=%d)", sessionID, wrapErr, n)
+					continue
+				}
+				if !replay.accept(payload) {
 					continue
 				}
 				payload = plain[:m]
@@ -283,12 +281,56 @@ func RunRawSession(
 	defer d.Unregister(slot)
 
 	var proxyWg sync.WaitGroup
-	proxyWg.Add(2)
+	proxyWg.Add(3) // keepalive planner + writer + reader
+	sessionErrCh := make(chan error, 1)
 
 	stopPlain := context.AfterFunc(sessCtx, func() {
 		_ = plainConn.SetDeadline(time.Now())
 	})
 	defer stopPlain()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = plainConn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+			_, _ = plainConn.Write([]byte("DISCONNECT_RAW:" + deviceID))
+		case <-sessCtx.Done():
+		}
+	}()
+
+	liveness := newSessionLiveness(time.Now())
+	go func() {
+		defer proxyWg.Done()
+		t := time.NewTicker(livenessTick)
+		defer t.Stop()
+		planner := newLivenessPlanner(liveness, time.Now())
+		for {
+			select {
+			case <-sessCtx.Done():
+				return
+			case now := <-t.C:
+				st := planner.step(now, lowPowerMode.Load())
+				if st.dead {
+					log.Printf("[RAW #%d] Сервер не отвечает %d с — поток мёртв, переподключаем", sessionID, int(st.silent.Seconds()))
+					select {
+					case sessionErrCh <- fmt.Errorf("поток не отвечает %d с", int(st.silent.Seconds())):
+					default:
+					}
+					sessCancel()
+					return
+				}
+				if !st.sendKeepalive {
+					continue
+				}
+				pkt := makeKeepalivePacket(deviceID)
+				select {
+				case slot.PrioCh <- pkt:
+				default:
+					putPktBuf(pkt)
+				}
+			}
+		}
+	}()
 
 	go func() {
 		defer proxyWg.Done()
@@ -299,7 +341,7 @@ func RunRawSession(
 			if !ok {
 				return
 			}
-			_ = plainConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
+			_ = plainConn.SetWriteDeadline(time.Now().Add(3 * time.Second))
 			if atomic.CompareAndSwapUint32(&firstPeerWrite, 0, 1) {
 				log.Printf("[RAW #%d] [ДЕБАГ] Первый IP-пакет на peer (%d байт)", sessionID, len(pkt))
 			}
@@ -307,6 +349,10 @@ func RunRawSession(
 			putPktBuf(pkt)
 			if writeErr != nil {
 				log.Printf("[RAW #%d] Ошибка Writer: %v", sessionID, writeErr)
+				select {
+				case sessionErrCh <- fmt.Errorf("transport writer: %w", writeErr):
+				default:
+				}
 				return
 			}
 		}
@@ -327,14 +373,25 @@ func RunRawSession(
 					continue
 				}
 				log.Printf("[RAW #%d] Ошибка Reader: %v", sessionID, readErr)
+				select {
+				case sessionErrCh <- fmt.Errorf("transport reader: %w", readErr):
+				default:
+				}
 				return
 			}
 			if n <= 0 {
 				continue
 			}
 			if b[0] == keepaliveByte {
+				if n == 1 {
+					liveness.notePong(time.Now())
+				}
 				continue
 			}
+			now := time.Now()
+			liveness.noteRx(now)
+			diagLastDownlink.Store(now.UnixMilli())
+
 			if atomic.CompareAndSwapUint32(&firstPeerRead, 0, 1) {
 				log.Printf("[RAW #%d] [ДЕБАГ] Первый IP-пакет от peer (%d байт)", sessionID, n)
 			}
@@ -345,6 +402,8 @@ func RunRawSession(
 			case <-sessCtx.Done():
 				putPktBuf(pkt)
 				return
+			default:
+				putPktBuf(pkt)
 			}
 		}
 	}()
@@ -356,5 +415,10 @@ func RunRawSession(
 	_ = pipeA.Close()
 	_ = pipeB.Close()
 	log.Printf("[RAW #%d] Завершена", sessionID)
+	select {
+	case sessionErr := <-sessionErrCh:
+		return configDelivered, sessionErr
+	default:
+	}
 	return configDelivered, nil
 }

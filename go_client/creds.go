@@ -278,8 +278,8 @@ func fetchVkCredsSerialized(ctx context.Context, link string, streamID int) (str
 	vkRequestMu.Lock()
 	defer vkRequestMu.Unlock()
 
-	// Throttle: 3-6 seconds between requests
-	minInterval := 3*time.Second + time.Duration(rand.Intn(3000))*time.Millisecond
+	// Короткая пауза между сериализованными запросами к VK — ускоряет каскадный набор групп.
+	minInterval := 600*time.Millisecond + time.Duration(rand.Intn(400))*time.Millisecond
 	elapsed := time.Since(globalLastVkFetchTime)
 
 	if !globalLastVkFetchTime.IsZero() && elapsed < minInterval {
@@ -751,22 +751,6 @@ func requestWebViewCaptcha(streamID int, captchaErr *VkCaptchaError, mode string
 
 func isWebViewCaptchaTimeout(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "timed out")
-}
-
-func turnURLsToAddresses(urls []string) []string {
-	var addresses []string
-	for _, urlStr := range urls {
-		urlStr = strings.TrimSpace(urlStr)
-		if urlStr == "" {
-			continue
-		}
-		clean := strings.Split(urlStr, "?")[0]
-		address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
-		if address != "" {
-			addresses = append(addresses, address)
-		}
-	}
-	return addresses
 }
 
 // ─── GetCreds returns TURN credentials for a given stream ───

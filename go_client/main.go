@@ -178,6 +178,10 @@ func main() {
 				atomic.StoreInt32(&pauseFlag, 1)
 			case line == "RESUME":
 				atomic.StoreInt32(&pauseFlag, 0)
+			case line == "SCREEN_OFF":
+				lowPowerMode.Store(true)
+			case line == "SCREEN_ON":
+				lowPowerMode.Store(false)
 			case line == "STOP":
 				cancel()
 				return
@@ -192,7 +196,7 @@ func main() {
 		}
 	}()
 
-	host := flag.String("turn", "", "переопределить IP TURN")
+	host := flag.String("turn", "", "свои TURN-адреса вместо адресов VK: IP или IP:порт через запятую")
 	port := flag.String("port", "", "переопределить порт TURN")
 	listen := flag.String("listen", "127.0.0.1:9000", "локальный адрес")
 	vkHash := flag.String("vk", "", "хеши VK-звонков (через запятую)")
@@ -213,6 +217,14 @@ func main() {
 	socksAddr := flag.String("socks", "127.0.0.1:1080", "локальный SOCKS5 (только -mode socks)")
 	flowHashFlag := flag.String("flow-hash", "auto", "режим привязки потоков: auto (по архитектуре: true для mips/mipsel, false для arm/x86), true (eco/mips), false (fast/chunked)")
 	chunkSizeFlag := flag.Int("chunk-size", 0, "размер чанка в пакетах при flow-hash=false (0 = адаптивный 64/24/8/3/1, dwell 25ms)")
+	noDTLS := flag.Bool("notls", false, "прямой режим: RTP-obfs AEAD без DTLS поверх TURN (нужен сервер с -listen-direct)")
+	turnTCP := flag.Bool("turn-tcp", false, "то же, что -turn-transport tcp (оставлено для совместимости)")
+	turnTransport := flag.String("turn-transport", "", "транспорт до TURN-relay VK: udp или tcp (по умолчанию udp, или tcp при -turn-tcp)")
+	diagOnly := flag.Bool("diag", false, "проверить соединение через VK (TURN, сервер, пароль, порты, MTU) и выйти")
+	diagKeyToken := flag.String("diag-key", "", "ключ диагностики сервера из ссылки (dk=)")
+	diagPortsFlag := flag.String("diag-ports", "", "порты сервера для проверки: dtls=56000,direct=56002,raw=56003")
+	diagAuto := flag.Bool("diag-auto", true, "проверять соединение автоматически, если туннель не поднимается")
+	diagTrigger := flag.String("diag-trigger", "", "файл-триггер: появился — запустить проверку")
 
 	flag.Parse()
 	applyCompatFlags(vkAuthMode, vkAnonPath)
@@ -297,12 +309,57 @@ func main() {
 		*numW = (*numW / workersPerGroup) * workersPerGroup
 	}
 
+	activeTurnTransport := normalizeTurnTransport(*turnTransport)
+	if strings.TrimSpace(*turnTransport) == "" && *turnTCP {
+		activeTurnTransport = turnTransportTCP
+	}
+
 	tp := &TurnParams{
-		Host:     *host,
-		Port:     *port,
-		Hashes:   hashes,
-		WrapKey:  wrapKey,
-		ObfsMode: normalizeObfsMode(*obfsMode),
+		Hosts:     parseTurnHosts(*host),
+		Port:      *port,
+		Hashes:    hashes,
+		WrapKey:   wrapKey,
+		ObfsMode:  normalizeObfsMode(*obfsMode),
+		NoDTLS:    *noDTLS,
+		RawMode:   activeConnMode == "rawtun",
+		Transport: activeTurnTransport,
+	}
+
+	diagCfg := &diagConfig{
+		TP:       tp,
+		Peer:     peer,
+		Listener: diagTargetListener(tp),
+		Ports:    parseDiagPorts(*diagPortsFlag),
+		Password: *connPassword,
+		DeviceID: *deviceID,
+	}
+	if secret, err := parseDiagToken(*diagKeyToken); err != nil {
+		log.Printf("[ДИАГ] %v — проверка будет без ключа сервера", err)
+	} else if secret != nil {
+		if key, err := deriveDiagKey(secret); err == nil {
+			diagCfg.DiagKey = key
+		}
+	}
+	diagHash := hashes[0]
+	diagCfg.Creds = func(ctx context.Context, fresh bool) (*Credentials, error) {
+		stream := 100
+		if fresh {
+			stream = 990
+			getStreamCache(stream).invalidate(stream)
+		}
+		u, p, urls, err := GetCreds(ctx, diagHash, stream)
+		if err != nil {
+			return nil, err
+		}
+		return &Credentials{User: u, Pass: p, TurnURLs: urls, CacheStreamID: stream}, nil
+	}
+
+	if *diagOnly {
+		v := runDiagnostics(ctx, diagCfg, "manual")
+		if v.Sev == "error" {
+			os.Exit(2)
+		}
+		return
 	}
 
 	if *pingOnly {
@@ -349,6 +406,8 @@ func main() {
 			close(shutdownCh)
 		}()
 		go stats.RunLoop(shutdownCh)
+		diagCfg.TunnelReceiving = tunnelReceivingRecently
+		go diagWatchdog(ctx, diagCfg, stats, &pauseFlag, *diagAuto, *diagTrigger)
 
 		runRawTunClient(ctx, tp, peer, *numW, *deviceID, *connPassword, stats, &pauseFlag, activeFlowHash, activeChunkSize)
 		return
@@ -410,6 +469,8 @@ func main() {
 		close(shutdownCh)
 	}()
 	go stats.RunLoop(shutdownCh)
+	diagCfg.TunnelReceiving = tunnelReceivingRecently
+	go diagWatchdog(ctx, diagCfg, stats, &pauseFlag, *diagAuto, *diagTrigger)
 
 	disp := NewDispatcher(ctx, localConn, stats)
 	defer disp.Shutdown()

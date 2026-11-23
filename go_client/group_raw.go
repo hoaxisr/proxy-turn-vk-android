@@ -63,10 +63,12 @@ func WorkerGroupRaw(
 		creds = &Credentials{User: user, Pass: pass, TurnURLs: turnURLs, CacheStreamID: credStreamID}
 	} else {
 		log.Printf("[ГРУППА #%d] Ошибка кредов: %v", groupID, err)
+		markDiagCredsFailed()
 		return
 	}
 
 	log.Printf("[ГРУППА #%d] Креды OK, TURN: %v, %d raw-воркеров", groupID, creds.TurnURLs, len(workerIDs))
+	markDiagCredsReady()
 
 	var wg sync.WaitGroup
 	var credsMu sync.RWMutex
@@ -103,15 +105,19 @@ func WorkerGroupRaw(
 
 	if signalReady != nil {
 		go func() {
-			time.Sleep(2 * time.Second)
+			delayMs := 500 + rand.Intn(250)
+			time.Sleep(time.Duration(delayMs) * time.Millisecond)
 			close(signalReady)
 			log.Printf("[ГРУППА #%d] Успешный старт! Передача эстафеты следующей группе...", groupID)
 		}()
 	}
 
+	allocateTicker := time.NewTicker(allocateGateInterval)
+	defer allocateTicker.Stop()
+
 	for i, wid := range workerIDs {
 		wg.Add(1)
-		workerDelay := time.Duration(i) * 500 * time.Millisecond
+		workerDelay := time.Duration(i) * 75 * time.Millisecond
 
 		go func(wid int, delay time.Duration) {
 			defer wg.Done()
@@ -126,6 +132,7 @@ func WorkerGroupRaw(
 
 			shouldGetConfig := getConfig
 			attempt := 0
+			quotaStreak := 0
 
 			for {
 				if ctx.Err() != nil {
@@ -145,10 +152,12 @@ func WorkerGroupRaw(
 				credsSnapshot.TurnURLs = cloneStringSlice(creds.TurnURLs)
 				credsMu.RUnlock()
 
+				sessStarted := time.Now()
 				configDelivered, sessErr := RunRawSession(ctx, tp, peer, d,
-					getConf, cc, wid, &credsSnapshot, deviceID, password, stats)
+					getConf, cc, wid, &credsSnapshot, deviceID, password, stats, allocateTicker.C)
 
 				quotaRetry := false
+				fastRetry := false
 				if getConf && configDelivered {
 					atomic.StoreInt32(&configSent, 1)
 				}
@@ -159,6 +168,9 @@ func WorkerGroupRaw(
 					}
 					errStr := sessErr.Error()
 					errStrLower := strings.ToLower(errStr)
+					fastRetry = strings.Contains(errStrLower, "broken pipe") ||
+						strings.Contains(errStrLower, "connection reset by peer") ||
+						strings.Contains(errStrLower, "unexpected eof")
 
 					turnAllocAttrMissing := strings.Contains(errStrLower, "turn allocate") &&
 						strings.Contains(errStrLower, "attribute not found")
@@ -183,7 +195,11 @@ func WorkerGroupRaw(
 
 					attempt++
 					if isTurnQuota {
-						log.Printf("[ВОРКЕР #%d] [TURN] Квота relay, ждём: %s", wid, errStr)
+						quotaStreak++
+						log.Printf("[ВОРКЕР #%d] [TURN] Квота relay исчерпана (%d-й раз подряд), повтор через %v: %s", wid, quotaStreak, quotaRetryDelay(quotaStreak).Truncate(time.Second), errStr)
+						if quotaStreak >= 2 && getVkAuthMode() != "account" {
+							refreshCreds("TURN quota")
+						}
 					} else if turnAllocAttrMissing || turnCredRefreshNeeded {
 						refreshCreds("TURN allocation error")
 					} else {
@@ -202,9 +218,17 @@ func WorkerGroupRaw(
 					return
 				}
 
-				retryDelay := time.Duration(5+rand.Intn(11)) * time.Second
+				if time.Since(sessStarted) > 60*time.Second {
+					attempt = 1
+				}
+				if !quotaRetry {
+					quotaStreak = 0
+				}
+				retryDelay := workerRetryDelay(attempt)
 				if quotaRetry {
-					retryDelay = time.Duration(30+rand.Intn(31)) * time.Second
+					retryDelay = quotaRetryDelay(quotaStreak)
+				} else if fastRetry {
+					retryDelay = time.Duration(1+rand.Intn(3)) * time.Second
 				}
 				select {
 				case <-time.After(retryDelay):

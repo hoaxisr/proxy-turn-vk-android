@@ -13,6 +13,36 @@ import (
 
 const workersPerGroup = 9
 
+const allocateGateInterval = 100 * time.Millisecond
+
+func quotaRetryDelay(streak int) time.Duration {
+	if streak < 1 {
+		streak = 1
+	}
+	d := 2 * time.Second
+	for i := 1; i < streak && d < 30*time.Second; i++ {
+		d *= 2
+	}
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d + time.Duration(rand.Intn(1000))*time.Millisecond
+}
+
+func workerRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	d := 500 * time.Millisecond
+	for i := 1; i < attempt && d < 8*time.Second; i++ {
+		d *= 2
+	}
+	if d > 8*time.Second {
+		d = 8 * time.Second
+	}
+	return d + time.Duration(rand.Intn(500))*time.Millisecond
+}
+
 // WorkerGroup:
 // Запускает 9 потоков с одними кредами. Ротации нет — работает до смерти воркеров.
 func WorkerGroup(
@@ -69,10 +99,12 @@ func WorkerGroup(
 		creds = &Credentials{User: user, Pass: pass, TurnURLs: turnURLs, CacheStreamID: credStreamID}
 	} else {
 		log.Printf("[ГРУППА #%d] Ошибка кредов: %v", groupID, err)
+		markDiagCredsFailed()
 		return
 	}
 
 	log.Printf("[ГРУППА #%d] Креды OK, TURN: %v, %d воркеров", groupID, creds.TurnURLs, len(workerIDs))
+	markDiagCredsReady()
 
 	var configRequestInFlight int32
 	var wg sync.WaitGroup
@@ -109,20 +141,23 @@ func WorkerGroup(
 		return true
 	}
 
-	// Сигнализируем следующей группе, что мы успешно запустились (креды получены + 2 сек форы)
+	// Сигнализируем следующей группе, что мы успешно запустились (креды получены + фора)
 	if signalReady != nil {
 		go func() {
-			time.Sleep(2000 * time.Millisecond)
+			delayMs := 500 + rand.Intn(250)
+			time.Sleep(time.Duration(delayMs) * time.Millisecond)
 			close(signalReady)
 			log.Printf("[ГРУППА #%d] Успешный старт! Передача эстафеты следующей группе...", groupID)
 		}()
 	}
 
+	allocateTicker := time.NewTicker(allocateGateInterval)
+	defer allocateTicker.Stop()
+
 	for i, wid := range workerIDs {
 		wg.Add(1)
 
-		// Stagger: 500мс между воркерами
-		workerDelay := time.Duration(i) * 500 * time.Millisecond
+		workerDelay := time.Duration(i) * 75 * time.Millisecond
 
 		go func(wid int, delay time.Duration) {
 			defer wg.Done()
@@ -137,6 +172,7 @@ func WorkerGroup(
 
 			shouldGetConfig := getConfig
 			attempt := 0
+			quotaStreak := 0
 
 			for {
 				if ctx.Err() != nil {
@@ -157,10 +193,12 @@ func WorkerGroup(
 				credsSnapshot.TurnURLs = cloneStringSlice(creds.TurnURLs)
 				credsMu.RUnlock()
 
+				sessStarted := time.Now()
 				configDelivered, sessErr := RunSession(ctx, tp, peer, d, localPort,
-					getConf, cc, wid, &credsSnapshot, deviceID, password, stats)
+					getConf, cc, wid, &credsSnapshot, deviceID, password, stats, allocateTicker.C)
 
 				quotaRetry := false
+				fastRetry := false
 				if getConf {
 					if configDelivered {
 						atomic.StoreInt32(&configSent, 1)
@@ -175,6 +213,9 @@ func WorkerGroup(
 					}
 					errStr := sessErr.Error()
 					errStrLower := strings.ToLower(errStr)
+					fastRetry = strings.Contains(errStrLower, "broken pipe") ||
+						strings.Contains(errStrLower, "connection reset by peer") ||
+						strings.Contains(errStrLower, "unexpected eof")
 
 					turnAllocAttrMissing := strings.Contains(errStrLower, "turn allocate") &&
 						strings.Contains(errStrLower, "attribute not found")
@@ -204,7 +245,11 @@ func WorkerGroup(
 
 					attempt++
 					if isTurnQuota {
-						log.Printf("[ВОРКЕР #%d] [TURN] Квота relay исчерпана (один аккаунт VK = мало слотов), ждём: %s", wid, errStr)
+						quotaStreak++
+						log.Printf("[ВОРКЕР #%d] [TURN] Квота relay исчерпана (%d-й раз подряд), повтор через %v: %s", wid, quotaStreak, quotaRetryDelay(quotaStreak).Truncate(time.Second), errStr)
+						if quotaStreak >= 2 && getVkAuthMode() != "account" {
+							refreshCreds("TURN quota")
+						}
 					} else if turnAllocAttrMissing {
 						log.Printf("[ВОРКЕР #%d] [TURN] Allocate вернул неполный ответ, обновляем TURN-креды и повторяем (попытка %d): %s", wid, attempt, errStr)
 						refreshCreds("TURN Allocate attribute-not-found")
@@ -229,9 +274,17 @@ func WorkerGroup(
 					return
 				}
 
-				retryDelay := time.Duration(5+rand.Intn(11)) * time.Second
+				if time.Since(sessStarted) > 60*time.Second {
+					attempt = 1
+				}
+				if !quotaRetry {
+					quotaStreak = 0
+				}
+				retryDelay := workerRetryDelay(attempt)
 				if quotaRetry {
-					retryDelay = time.Duration(30+rand.Intn(31)) * time.Second
+					retryDelay = quotaRetryDelay(quotaStreak)
+				} else if fastRetry {
+					retryDelay = time.Duration(1+rand.Intn(3)) * time.Second
 				}
 				select {
 				case <-time.After(retryDelay):
@@ -286,11 +339,14 @@ func normalizeVKJoinHash(input string) string {
 
 // TurnParams — конфигурация TURN
 type TurnParams struct {
-	Host     string
-	Port     string
-	Hashes   []string
-	WrapKey  []byte // Password-derived WRAP key (32 bytes), nil = disabled
-	ObfsMode string // "audio" or "video" — RTP masking mode
+	Hosts     []string
+	Port      string
+	Hashes    []string
+	WrapKey   []byte // Password-derived WRAP key (32 bytes), nil = disabled
+	ObfsMode  string // "audio" or "video" — RTP masking mode
+	NoDTLS    bool
+	RawMode   bool
+	Transport string
 }
 
 // Credentials — учетные данные TURN
