@@ -277,6 +277,7 @@ func RunRawSession(
 	slot := &WorkerSlot{
 		ID:     sessionID,
 		SendCh: make(chan []byte, workerSendBuf),
+		PrioCh: make(chan []byte, prioBuf),
 	}
 	d.Register(slot)
 	defer d.Unregister(slot)
@@ -292,24 +293,21 @@ func RunRawSession(
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
+		defer drainWorkerSlot(slot)
 		for {
-			select {
-			case <-sessCtx.Done():
+			pkt, ok := dequeueWorkerPkt(sessCtx, slot)
+			if !ok {
 				return
-			case pkt, ok := <-slot.SendCh:
-				if !ok {
-					return
-				}
-				_ = plainConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
-				if atomic.CompareAndSwapUint32(&firstPeerWrite, 0, 1) {
-					log.Printf("[RAW #%d] [ДЕБАГ] Первый IP-пакет на peer (%d байт)", sessionID, len(pkt))
-				}
-				_, writeErr := plainConn.Write(pkt)
-				putPktBuf(pkt)
-				if writeErr != nil {
-					log.Printf("[RAW #%d] Ошибка Writer: %v", sessionID, writeErr)
-					return
-				}
+			}
+			_ = plainConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
+			if atomic.CompareAndSwapUint32(&firstPeerWrite, 0, 1) {
+				log.Printf("[RAW #%d] [ДЕБАГ] Первый IP-пакет на peer (%d байт)", sessionID, len(pkt))
+			}
+			_, writeErr := plainConn.Write(pkt)
+			putPktBuf(pkt)
+			if writeErr != nil {
+				log.Printf("[RAW #%d] Ошибка Writer: %v", sessionID, writeErr)
+				return
 			}
 		}
 	}()
