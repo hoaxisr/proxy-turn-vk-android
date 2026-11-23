@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,6 +55,35 @@ func drainCaptchaResult() {
 	case <-CaptchaResultChan:
 	default:
 	}
+}
+
+func resolveFlowHash(val string) bool {
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "true", "1", "yes", "on", "eco":
+		return true
+	case "false", "0", "no", "off", "fast":
+		return false
+	case "auto", "":
+		// На MIPS/MIPSEL включаем flow-hash для экономии ресурсов слабого CPU.
+		// На ARM, ARM64, AMD64 используем 8-пакетный Round-Robin для максимальной скорости.
+		return isMIPSArch(runtime.GOARCH)
+	default:
+		return isMIPSArch(runtime.GOARCH)
+	}
+}
+
+func resolveChunkSize(val int) int {
+	if val <= 0 {
+		return 0
+	}
+	return val
+}
+
+func formatChunkMode(chunkSize int) string {
+	if chunkSize <= 0 {
+		return fmt.Sprintf("auto(64/24/8/3/1,dwell=%dms)", maxDwellMS)
+	}
+	return fmt.Sprintf("%d", chunkSize)
 }
 
 func runHashChecks(ctx context.Context, hashes []string) {
@@ -181,9 +211,13 @@ func main() {
 	checkHashes := flag.Bool("check-hashes", false, "проверить VK-хеши и выйти")
 	connMode := flag.String("mode", "vpn", "режим клиента (vpn|socks|rawtun)")
 	socksAddr := flag.String("socks", "127.0.0.1:1080", "локальный SOCKS5 (только -mode socks)")
+	flowHashFlag := flag.String("flow-hash", "auto", "режим привязки потоков: auto (по архитектуре: true для mips/mipsel, false для arm/x86), true (eco/mips), false (fast/chunked)")
+	chunkSizeFlag := flag.Int("chunk-size", 0, "размер чанка в пакетах при flow-hash=false (0 = адаптивный 64/24/8/3/1, dwell 25ms)")
 
 	flag.Parse()
 	applyCompatFlags(vkAuthMode, vkAnonPath)
+	activeFlowHash := resolveFlowHash(*flowHashFlag)
+	activeChunkSize := resolveChunkSize(*chunkSizeFlag)
 	activeConnMode := strings.ToLower(strings.TrimSpace(*connMode))
 	switch activeConnMode {
 	case "socks":
@@ -304,6 +338,7 @@ func main() {
 		log.Printf("[КЛИЕНТ] Пир (raw): %s", *peerAddr)
 		log.Printf("[КЛИЕНТ] Режим: rawtun (TUN + WRAP, без DTLS/WG)")
 		log.Printf("[КЛИЕНТ] WRAP: %s", wrapStatus)
+		log.Printf("[КЛИЕНТ] Flow-hash: %v (chunk=%s, returnBuf=%d, sendBuf=%d, arch=%s)", activeFlowHash, formatChunkMode(activeChunkSize), returnChBuf, workerSendBuf, runtime.GOARCH)
 		log.Printf("[КЛИЕНТ] Device ID: %s", *deviceID)
 		log.Println("[КЛИЕНТ] ═══════════════════════════════════════")
 
@@ -315,7 +350,7 @@ func main() {
 		}()
 		go stats.RunLoop(shutdownCh)
 
-		runRawTunClient(ctx, tp, peer, *numW, *deviceID, *connPassword, stats, &pauseFlag)
+		runRawTunClient(ctx, tp, peer, *numW, *deviceID, *connPassword, stats, &pauseFlag, activeFlowHash, activeChunkSize)
 		return
 	}
 

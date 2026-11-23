@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,13 +21,14 @@ import (
 )
 
 const (
-	workerSendBuf      = 128
 	sessionReadTimeout = 30 * time.Minute // Increased from 60s to 30min
 	readBufSize        = 1600
 	socketBufSize      = 625 * 1024
 	keepaliveByte      = 0xFF // DTLS-level keepalive marker
 	keepaliveInterval  = 15 * time.Second
 )
+
+var workerSendBuf = defaultWorkerSendBuf(runtime.GOARCH)
 
 // Handshake semaphore: limit to 3 concurrent DTLS handshakes
 var handshakeSem = make(chan struct{}, 3)
@@ -346,6 +348,7 @@ func RunSession(
 	slot := &WorkerSlot{
 		ID:     sessionID,
 		SendCh: make(chan []byte, workerSendBuf),
+		PrioCh: make(chan []byte, prioBuf),
 	}
 	d.Register(slot)
 	defer d.Unregister(slot)
@@ -382,24 +385,21 @@ func RunSession(
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
+		defer drainWorkerSlot(slot)
 		for {
-			select {
-			case <-sessCtx.Done():
+			pkt, ok := dequeueWorkerPkt(sessCtx, slot)
+			if !ok {
 				return
-			case pkt, ok := <-slot.SendCh:
-				if !ok {
-					return
-				}
-				_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
-				if atomic.CompareAndSwapUint32(&firstDtlsWrite, 0, 1) {
-					log.Printf("[ВОРКЕР #%d] [ДЕБАГ] Отправлен ПЕРВЫЙ пакет в DTLS-соединение (%d байт)", sessionID, len(pkt))
-				}
-				_, writeErr := dtlsConn.Write(pkt)
-				putPktBuf(pkt)
-				if writeErr != nil {
-					log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
-					return
-				}
+			}
+			_ = dtlsConn.SetWriteDeadline(time.Now().Add(sessionReadTimeout))
+			if atomic.CompareAndSwapUint32(&firstDtlsWrite, 0, 1) {
+				log.Printf("[ВОРКЕР #%d] [ДЕБАГ] Отправлен ПЕРВЫЙ пакет в DTLS-соединение (%d байт)", sessionID, len(pkt))
+			}
+			_, writeErr := dtlsConn.Write(pkt)
+			putPktBuf(pkt)
+			if writeErr != nil {
+				log.Printf("[ВОРКЕР #%d] Ошибка Writer: %v", sessionID, writeErr)
+				return
 			}
 		}
 	}()

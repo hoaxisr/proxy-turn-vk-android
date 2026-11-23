@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"log"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,16 +33,97 @@ func putPktBuf(b []byte) {
 	pktPool.Put(b[:cap(b)])
 }
 
-const (
-	returnChBuf = 384
+func isMIPSArch(arch string) bool {
+	return arch == "mips" || arch == "mipsle"
+}
 
-	// chunkSize — для vpn/socks (WireGuard): WG replay window переживает reorder между chunk'ами.
-	chunkSize = 8
+func defaultReturnChBuf(arch string) int {
+	if isMIPSArch(arch) {
+		return 384
+	}
+	return 512
+}
+
+func defaultWorkerSendBuf(arch string) int {
+	if isMIPSArch(arch) {
+		return 128
+	}
+	return 256
+}
+
+const (
+	prioBuf       = 32
+	prioThreshold = 128
+
+	// maxDwellMS — максимальное время (мс) удержания одного воркера при
+	// адаптивном chunking, если трафик редкий и счётчик чанка не набрался.
+	maxDwellMS = 25
 )
+
+func chunkSizeFor(pktSize int) int {
+	switch {
+	case pktSize > 1100:
+		return 64
+	case pktSize >= 701:
+		return 24
+	case pktSize >= 301:
+		return 8
+	case pktSize >= 101:
+		return 3
+	default:
+		return 1
+	}
+}
+
+var returnChBuf = defaultReturnChBuf(runtime.GOARCH)
 
 type WorkerSlot struct {
 	ID     int
 	SendCh chan []byte
+	PrioCh chan []byte
+}
+
+func dequeueWorkerPkt(ctx context.Context, slot *WorkerSlot) ([]byte, bool) {
+	select {
+	case pkt, ok := <-slot.PrioCh:
+		return pkt, ok
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return nil, false
+	case pkt, ok := <-slot.PrioCh:
+		return pkt, ok
+	case pkt, ok := <-slot.SendCh:
+		return pkt, ok
+	}
+}
+
+func drainWorkerSlot(slot *WorkerSlot) {
+	for {
+		select {
+		case p, ok := <-slot.PrioCh:
+			if !ok {
+				slot.PrioCh = nil
+				continue
+			}
+			putPktBuf(p)
+		default:
+			goto drainSend
+		}
+	}
+drainSend:
+	for {
+		select {
+		case p, ok := <-slot.SendCh:
+			if !ok {
+				return
+			}
+			putPktBuf(p)
+		default:
+			return
+		}
+	}
 }
 
 type Dispatcher struct {
@@ -51,7 +133,9 @@ type Dispatcher struct {
 	workers      []*WorkerSlot
 	rrIndex      int
 	rrCount      int
-	flowHash     bool // rawtun: привязка TCP/UDP-потока к одному relay (нет WG replay)
+	chunkStartTs int64 // unix millis начала текущего чанка при адаптивном chunking
+	flowHash     bool  // rawtun: true для MIPS (eco), false для ARM/x86 (fast chunked)
+	chunkSize    int   // <= 0 = адаптивный (64/24/8/3/1 + dwell 25ms), > 0 = фиксированный
 	ReturnCh     chan []byte
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -62,19 +146,20 @@ type Dispatcher struct {
 }
 
 func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) *Dispatcher {
-	return newDispatcher(ctx, localConn, stats, false)
+	return newDispatcher(ctx, localConn, stats, false, 0)
 }
 
-// NewRawTunDispatcher — uplink по 5-tuple hash: iperf/TCP не рвётся при N workers.
-func NewRawTunDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) *Dispatcher {
-	return newDispatcher(ctx, localConn, stats, true)
+// NewRawTunDispatcher создает диспетчер для rawtun с настраиваемым flowHash и chunkSize.
+func NewRawTunDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats, flowHash bool, chunkSize int) *Dispatcher {
+	return newDispatcher(ctx, localConn, stats, flowHash, chunkSize)
 }
 
-func newDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats, flowHash bool) *Dispatcher {
+func newDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats, flowHash bool, chunkSize int) *Dispatcher {
 	dctx, dcancel := context.WithCancel(ctx)
 	d := &Dispatcher{
 		localConn: localConn,
 		flowHash:  flowHash,
+		chunkSize: chunkSize,
 		ReturnCh:  make(chan []byte, returnChBuf),
 		ctx:       dctx,
 		cancel:    dcancel,
@@ -113,6 +198,7 @@ func (d *Dispatcher) Unregister(slot *WorkerSlot) {
 		d.rrIndex = d.rrIndex % remaining
 	}
 	d.rrCount = 0
+	d.chunkStartTs = 0
 	d.mu.Unlock()
 	log.Printf("[ДИСП] Воркер #%d отключён (осталось: %d)", slot.ID, remaining)
 }
@@ -186,27 +272,78 @@ func (d *Dispatcher) readLoop() {
 		if d.flowHash {
 			if h, ok := ipv4FlowHash(pkt); ok {
 				w := d.workers[int(h%uint32(nw))]
-				d.mu.Unlock()
+				if len(pkt) <= prioThreshold && w.PrioCh != nil {
+					select {
+					case w.PrioCh <- pkt:
+						d.mu.Unlock()
+						continue
+					default:
+					}
+				}
 				select {
 				case w.SendCh <- pkt:
-				case <-d.ctx.Done():
+				default:
 					putPktBuf(pkt)
-					return
 				}
+				d.mu.Unlock()
 				continue
 			}
 		}
 
-		sent := false
+		if len(pkt) <= prioThreshold {
+			idx := d.rrIndex % nw
+			sentPrio := false
+			if d.workers[idx].PrioCh != nil {
+				select {
+				case d.workers[idx].PrioCh <- pkt:
+					sentPrio = true
+				default:
+				}
+			}
+			for i := 1; !sentPrio && i < nw; i++ {
+				altIdx := (idx + i) % nw
+				if d.workers[altIdx].PrioCh == nil {
+					continue
+				}
+				select {
+				case d.workers[altIdx].PrioCh <- pkt:
+					sentPrio = true
+				default:
+				}
+			}
+			if sentPrio {
+				d.mu.Unlock()
+				continue
+			}
+		}
+
+		chunkLimit := d.chunkSize
+		var now int64
+		if chunkLimit <= 0 {
+			chunkLimit = chunkSizeFor(len(pkt))
+			now = time.Now().UnixMilli()
+			if d.chunkStartTs == 0 {
+				d.chunkStartTs = now
+			} else if now-d.chunkStartTs >= maxDwellMS {
+				d.rrIndex = (d.rrIndex + 1) % nw
+				d.rrCount = 0
+				d.chunkStartTs = now
+			}
+		}
+
 		idx := d.rrIndex % nw
+		sent := false
 		w := d.workers[idx]
 		select {
 		case w.SendCh <- pkt:
 			sent = true
 			d.rrCount++
-			if d.rrCount >= chunkSize {
+			if d.rrCount >= chunkLimit {
 				d.rrIndex = (idx + 1) % nw
 				d.rrCount = 0
+				if now != 0 {
+					d.chunkStartTs = now
+				}
 			}
 		default:
 			for i := 1; i < nw; i++ {
@@ -214,8 +351,16 @@ func (d *Dispatcher) readLoop() {
 				select {
 				case d.workers[altIdx].SendCh <- pkt:
 					sent = true
-					d.rrIndex = altIdx
-					d.rrCount = 1
+					if chunkLimit <= 1 {
+						d.rrIndex = (altIdx + 1) % nw
+						d.rrCount = 0
+					} else {
+						d.rrIndex = altIdx
+						d.rrCount = 1
+					}
+					if now != 0 {
+						d.chunkStartTs = now
+					}
 				default:
 				}
 				if sent {
@@ -227,6 +372,9 @@ func (d *Dispatcher) readLoop() {
 		if !sent {
 			d.rrIndex = (idx + 1) % nw
 			d.rrCount = 0
+			if now != 0 {
+				d.chunkStartTs = now
+			}
 			putPktBuf(pkt)
 		}
 		d.mu.Unlock()
