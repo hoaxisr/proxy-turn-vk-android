@@ -3239,7 +3239,10 @@ func trackCredentialConnection(password, deviceID string, conn net.Conn) func() 
 	return func() {
 		credentialConnections.Lock()
 		delete(connections, conn)
-		if len(connections) == 0 {
+		// Смотрим на текущую карту, а не на свою: disconnect мог удалить нашу,
+		// клиент переподключился и завёл новую — её не трогаем, иначе новое
+		// соединение выпадет из учёта и не порвётся при отзыве пароля.
+		if len(credentialConnections.items[ownerID]) == 0 {
 			delete(credentialConnections.items, ownerID)
 		}
 		credentialConnections.Unlock()
@@ -3466,7 +3469,8 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			clientConn.Write([]byte("DENIED:device_mismatch"))
 			return
 		}
-		saveDB()
+		// Отступление от апстрима: тут был saveDB() — запись базы, которая
+		// ничего не меняет, на каждый AUTH каждого воркера (износ флеша роутера).
 		dbMutex.Unlock()
 
 		connDeviceID = deviceID

@@ -570,3 +570,21 @@ func TestLoopbackOnlyBind(t *testing.T) {
 		t.Fatalf("expected only loopback packet, got n=%d pkt=%q ep=%v", n, string(pkts[0][:sizes[0]]), eps[0])
 	}
 }
+
+func TestUntrackKeepsReplacementConnections(t *testing.T) {
+	oldConn, _ := net.Pipe()
+	newConn, _ := net.Pipe()
+	defer oldConn.Close()
+	defer newConn.Close()
+	untrackOld := trackCredentialConnection("pw-untrack", "dev", oldConn)
+	disconnectCredentialConnections("pw-untrack")
+	untrackNew := trackCredentialConnection("pw-untrack", "dev", newConn)
+	defer untrackNew()
+	untrackOld()
+	credentialConnections.Lock()
+	_, tracked := credentialConnections.items[wrapKeyID("pw-untrack")][newConn]
+	credentialConnections.Unlock()
+	if !tracked {
+		t.Fatal("untrack of a disconnected connection dropped the replacement")
+	}
+}
