@@ -3640,14 +3640,24 @@ type ObfsConfig struct {
 var aeadCache sync.Map
 var wrapCredentialBindings sync.Map
 
-const replayWindowSpan = uint64(4096 * 961)
-const replayWindowMaxEntries = 8192
+// replayWindowPackets — глубина окна повторов в пакетах (как span апстрима:
+// 4096 * 961 единиц ts).
+//
+// Отступление от апстрима: там окно — map[[12]byte]uint64 до 8192 записей,
+// ~350–430 КБ на соединение (24 воркера × абоненты на роутере). Здесь
+// битовая карта как в WireGuard (RFC 6479), 512 Б. Номер пакета точно
+// восстанавливается из ts: obfsWrapPacket пишет ts = initTs + 960*c + c>>16,
+// поэтому разность ts, делённая на 960 с отсечением к нулю, равна разности
+// номеров, пока |Δc| < 960*65536. accept зовётся после проверки AEAD —
+// подделать ts без ключа нельзя.
+const replayWindowPackets = 4096
 
 type replayWindow struct {
 	mu          sync.Mutex
-	seen        map[[12]byte]uint64
+	bits        [replayWindowPackets / 64]uint64
 	ssrc        uint32
-	highestTime uint64
+	topTs       uint32
+	top         uint64 // номер пакета с topTs; стартует с replayWindowPackets, чтобы не уйти ниже нуля
 	initialized bool
 }
 
@@ -3655,49 +3665,35 @@ func (w *replayWindow) accept(wire []byte) bool {
 	if len(wire) < rtpHeaderLen {
 		return false
 	}
-	ssrc := binary.BigEndian.Uint32(wire[8:12])
-	seq := binary.BigEndian.Uint16(wire[2:4])
 	ts := binary.BigEndian.Uint32(wire[4:8])
-	var nonce [12]byte
-	copy(nonce[:], obfsBuildNonce(ssrc, seq, ts))
+	ssrc := binary.BigEndian.Uint32(wire[8:12])
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.initialized {
-		w.ssrc = ssrc
-		w.highestTime = uint64(ts)
-		w.seen = make(map[[12]byte]uint64, 4096)
-		w.initialized = true
+		w.ssrc, w.topTs, w.top, w.initialized = ssrc, ts, replayWindowPackets, true
 	} else if w.ssrc != ssrc {
 		return false
 	}
-	if _, exists := w.seen[nonce]; exists {
+	d := int64(int32(ts-w.topTs)) / 960
+	switch {
+	case d >= replayWindowPackets:
+		w.bits = [replayWindowPackets / 64]uint64{}
+	case d > 0:
+		for i := w.top + 1; i <= w.top+uint64(d); i++ {
+			w.bits[(i%replayWindowPackets)/64] &^= 1 << (i % 64)
+		}
+	case -d >= replayWindowPackets:
 		return false
 	}
-	base := w.highestTime &^ uint64(0xffffffff)
-	extended := base | uint64(ts)
-	if extended+(1<<31) < w.highestTime {
-		extended += 1 << 32
-	} else if extended > w.highestTime+(1<<31) && extended >= 1<<32 {
-		extended -= 1 << 32
+	c := uint64(int64(w.top) + d)
+	if d > 0 {
+		w.top, w.topTs = c, ts
 	}
-	if extended+replayWindowSpan < w.highestTime {
+	word, mask := (c%replayWindowPackets)/64, uint64(1)<<(c%64)
+	if w.bits[word]&mask != 0 {
 		return false
 	}
-	if extended > w.highestTime {
-		w.highestTime = extended
-	}
-	if len(w.seen) >= replayWindowMaxEntries {
-		cutoff := w.highestTime - min(w.highestTime, replayWindowSpan)
-		for value, packetTime := range w.seen {
-			if packetTime < cutoff {
-				delete(w.seen, value)
-			}
-		}
-		if len(w.seen) >= replayWindowMaxEntries {
-			return false
-		}
-	}
-	w.seen[nonce] = extended
+	w.bits[word] |= mask
 	return true
 }
 
