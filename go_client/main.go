@@ -223,7 +223,10 @@ func main() {
 	diagOnly := flag.Bool("diag", false, "проверить соединение через VK (TURN, сервер, пароль, порты, MTU) и выйти")
 	diagKeyToken := flag.String("diag-key", "", "ключ диагностики сервера из ссылки (dk=)")
 	diagPortsFlag := flag.String("diag-ports", "", "порты сервера для проверки: dtls=56000,direct=56002,raw=56003")
-	diagAuto := flag.Bool("diag-auto", true, "проверять соединение автоматически, если туннель не поднимается")
+	// Отступление от апстрима (там true): на роутере автопроба берёт свой TURN
+	// Allocate и креды VK в обход awg-manager — тратит квоту, которой не хватает
+	// воркерам на медленном старте MIPS. Включается явно.
+	diagAuto := flag.Bool("diag-auto", false, "проверять соединение автоматически, если туннель не поднимается")
 	diagTrigger := flag.String("diag-trigger", "", "файл-триггер: появился — запустить проверку")
 
 	flag.Parse()
