@@ -33,7 +33,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -59,7 +58,6 @@ const (
 	diagRatePerSec = 30
 	diagRateBurst  = 60
 
-	diagJournalEvents = 64
 	diagJournalWindow = 15 * time.Minute
 	diagLogInterval   = time.Minute
 )
@@ -177,13 +175,6 @@ func deriveDiagKey(secret []byte) ([]byte, error) {
 
 // ─── Состояние диагностики ───
 
-type diagEvent struct {
-	At       time.Time
-	Listener string
-	Source   string
-	Text     string
-}
-
 type diagAuthFail struct {
 	Listener string
 	Source   string
@@ -207,17 +198,13 @@ type diagState struct {
 	tokens     float64
 	lastRefill time.Time
 
-	events    []diagEvent
 	authFails map[string]*diagAuthFail
-	probes    map[string]int // статус → сколько проб за окно журнала
-	probeLog  []time.Time
 }
 
 var serverDiag = &diagState{
 	ports:     map[string]int{},
 	seen:      map[string]time.Time{},
 	authFails: map[string]*diagAuthFail{},
-	probes:    map[string]int{},
 	tokens:    diagRateBurst,
 }
 
@@ -323,13 +310,6 @@ func sourceIP(addr net.Addr) string {
 	return addr.String()
 }
 
-func (s *diagState) addEventLocked(e diagEvent) {
-	s.events = append(s.events, e)
-	if len(s.events) > diagJournalEvents {
-		s.events = append(s.events[:0], s.events[len(s.events)-diagJournalEvents:]...)
-	}
-}
-
 // noteAuthFailure — RTP-похожий пакет от relay VK, который не расшифровался
 // ни одним ключом. Почти всегда это клиент с неверным/удалённым паролем.
 // В лог — не чаще раза в минуту на источник.
@@ -351,8 +331,6 @@ func (s *diagState) noteAuthFailure(listener string, addr net.Addr) {
 		n := f.Count - f.Logged
 		f.Logged = f.Count
 		f.LastLog = now
-		s.addEventLocked(diagEvent{At: now, Listener: listener, Source: src,
-			Text: fmt.Sprintf("не расшифровано пакетов: %d", n)})
 		logLine = fmt.Sprintf("[DIAG] %s ← %s: %d пакетов не расшифровано ни одним паролем — у клиента неверный или удалённый пароль", strings.ToUpper(listener), src, n)
 	}
 	if len(s.authFails) > 512 {
@@ -369,14 +347,7 @@ func (s *diagState) noteAuthFailure(listener string, addr net.Addr) {
 }
 
 func (s *diagState) noteProbe(listener string, addr net.Addr, keyKind, status string, replyLen int) {
-	now := time.Now()
 	src := sourceIP(addr)
-	s.mu.Lock()
-	s.probes[status]++
-	s.probeLog = append(s.probeLog, now)
-	s.addEventLocked(diagEvent{At: now, Listener: listener, Source: src,
-		Text: fmt.Sprintf("проба (%s): %s", keyKind, diagStatusText(status))})
-	s.mu.Unlock()
 	log.Printf("[DIAG] Проба через VK → %s от %s (ключ: %s): %s, ответ %d Б", strings.ToUpper(listener), src, keyKind, diagStatusText(status), replyLen)
 }
 
@@ -538,95 +509,4 @@ func (s *diagState) tryDiagKey(c *wrapPacketConn, raw, scratch []byte, addr net.
 	}
 	s.answerDiagProbe(c, raw, req, key, "", addr)
 	return true
-}
-
-// ─── Отчёт для бота ───
-
-func (s *diagState) Report() string {
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var b strings.Builder
-	b.WriteString("🩺 *Диагностика подключений* (за 15 мин)\n\n")
-
-	portText := func(name string) string {
-		if p := s.ports[name]; p > 0 {
-			return fmt.Sprintf("%d", p)
-		}
-		return "—"
-	}
-	fmt.Fprintf(&b, "Порты: DTLS %s · Direct %s · Raw %s\n", portText("dtls"), portText("direct"), portText("raw"))
-	if s.key != nil {
-		b.WriteString("Ключ диагностики: ✅ (кладётся в новые ссылки)\n")
-	} else {
-		b.WriteString("Ключ диагностики: ❌ не загружен\n")
-	}
-
-	recent := 0
-	for _, at := range s.probeLog {
-		if now.Sub(at) <= diagJournalWindow {
-			recent++
-		}
-	}
-	// Срезаем старые отметки, чтобы probeLog не рос бесконечно.
-	kept := s.probeLog[:0]
-	for _, at := range s.probeLog {
-		if now.Sub(at) <= diagJournalWindow {
-			kept = append(kept, at)
-		}
-	}
-	s.probeLog = kept
-	fmt.Fprintf(&b, "\n*Пробы клиентов через VK:* %d\n", recent)
-	if recent == 0 {
-		b.WriteString("_нет — значит, ни один клиент не дошёл до сервера с проверкой_\n")
-	}
-
-	var fails []*diagAuthFail
-	for _, f := range s.authFails {
-		if now.Sub(f.Last) <= diagJournalWindow {
-			fails = append(fails, f)
-		}
-	}
-	sort.Slice(fails, func(i, j int) bool { return fails[i].Last.After(fails[j].Last) })
-	if len(fails) > 0 {
-		b.WriteString("\n*Не расшифровано (неверный пароль у клиента):*\n")
-		for i, f := range fails {
-			if i == 8 {
-				break
-			}
-			fmt.Fprintf(&b, "• %s ← `%s`: %d шт., %s назад\n", strings.ToUpper(f.Listener), f.Source, f.Count, humanAgo(now.Sub(f.Last)))
-		}
-	}
-
-	var events []diagEvent
-	for _, e := range s.events {
-		if now.Sub(e.At) <= diagJournalWindow {
-			events = append(events, e)
-		}
-	}
-	if len(events) > 0 {
-		b.WriteString("\n*Последние события:*\n")
-		start := len(events) - 10
-		if start < 0 {
-			start = 0
-		}
-		for _, e := range events[start:] {
-			fmt.Fprintf(&b, "`%s` %s ← `%s`: %s\n", e.At.Format("15:04:05"), strings.ToUpper(e.Listener), e.Source, e.Text)
-		}
-	} else if len(fails) == 0 {
-		b.WriteString("\nОт relay VK за это время ничего не приходило.\nЕсли клиент при этом не может подключиться — VK не доставляет трафик до сервера (IP или порт заблокирован), либо порт закрыт файрволом.\n")
-	}
-	return b.String()
-}
-
-func humanAgo(d time.Duration) string {
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%d с", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%d мин", int(d.Minutes()))
-	default:
-		return fmt.Sprintf("%d ч", int(d.Hours()))
-	}
 }

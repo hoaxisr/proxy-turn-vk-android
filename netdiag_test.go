@@ -111,7 +111,6 @@ func setupDiagServer(t *testing.T) *diagTestServer {
 		ports:     map[string]int{},
 		seen:      map[string]time.Time{},
 		authFails: map[string]*diagAuthFail{},
-		probes:    map[string]int{},
 		tokens:    diagRateBurst,
 	}
 	t.Cleanup(func() { serverDiag = oldDiag })
@@ -271,10 +270,6 @@ func TestDiagUnknownKeyStaysSilent(t *testing.T) {
 	wrong, _ := deriveWrapKey("not-on-server")
 	if r, _ := clientProbe(t, srv, wrong, diagRequest{Nonce: nonce(50), Time: time.Now().Unix()}); r != nil {
 		t.Fatal("server must not answer a key it does not know")
-	}
-	report := serverDiag.Report()
-	if !strings.Contains(report, "Не расшифровано") || !strings.Contains(report, "127.0.0.1") {
-		t.Fatalf("auth failure must be in the journal:\n%s", report)
 	}
 }
 
@@ -441,7 +436,6 @@ func TestDiagProbeDirectAndRawSequential(t *testing.T) {
 		ports:     map[string]int{},
 		seen:      map[string]time.Time{},
 		authFails: map[string]*diagAuthFail{},
-		probes:    map[string]int{},
 		tokens:    diagRateBurst,
 	}
 	t.Cleanup(func() { serverDiag = oldDiag })
